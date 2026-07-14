@@ -4,4 +4,9 @@ Style guides for Viking Analytics codebases.
 
 | Language | Guide |
 |----------|-------|
-| Python   | [pyguide.html](pyguide.html) |
+| Python   | [pyguide](pyguide.md) |
+
+## Adding a new guide
+
+1. Add a `<lang>guide.md` file at the repo root.
+2. Add a row to this table.
