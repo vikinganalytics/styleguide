@@ -8,6 +8,27 @@ developer utilities, and the libraries behind them. Its goal is a design
 language that prevents common classes of errors by construction rather
 than by defensive handling.
 
+## Principles
+
+Two principles are the point of this guide; everything else is in service
+of them:
+
+1. **A robust type system, so that bugs cannot be represented.** The best
+   error handling is a state that cannot be constructed. Invariants are
+   pushed into types — frozen, validated, precise — so that the type
+   checker rejects whole classes of bugs before the program ever runs.
+2. **Strong boundaries and contracts between moving parts.** Parts must not
+   be able to interfere with each other in unintended or counterintuitive
+   ways — and when something messy sneaks in anyway, despite our best
+   intentions, the blast radius stays contained on one side of a boundary.
+
+Every rule below is either a consequence of these principles or a
+convention adopted for consistency (line length, jsonlines, import
+grouping). The distinction matters in review: a deviation that weakens a
+principle calls for a redesign, while a deviation from a convention needs
+only a good reason. When rules seem to conflict, resolve toward the
+principles.
+
 ## Precedence
 
 When making a design or style decision, consult in this order:
@@ -51,8 +72,17 @@ by a tool decays; put rules in configuration, not in code review.
   (e.g. `"T20"  # Print is intentional in a CLI tool`). Inline suppressions
   use the specific rule code, never a bare `# noqa`.
 
-- **ty** for type checking. All code is fully annotated; the `ANN` ruff rules
-  enforce this.
+- **mypy in strict mode** for type checking. All code is fully annotated:
+  the `ANN` ruff rules enforce that annotations are _present_; mypy
+  enforces that they _hold_. The choice of checker is deliberate, not
+  incidental: section 3's guarantees are only as strong as the checker's
+  understanding of `attrs` — mypy's attrs plugin understands `converter=`
+  and `validator=` semantics, and today no other checker verifiably does.
+  Revisit faster checkers (e.g. ty) once their attrs support is proven
+  against a test file of deliberate violations, not against release notes.
+- **import-linter** for module-boundary contracts (section 2). An
+  architecture that is enforced only by convention decays exactly the way
+  unenforced style does.
 - **vulture** for dead-code detection, with a committed allowlist file.
 - **pytest + coverage** with a high enforced floor (`--fail-under=99`).
   Coverage that is not enforced is decorative.
@@ -114,6 +144,36 @@ single-command CLI skips the dispatch; a library skips argparse. But _any_
 tool with configuration or input still builds a validated, frozen Context
 (or equivalent typed object) at its boundary, and its internals consume only
 that.
+
+### Module boundaries are contracts
+
+The pipeline above implies a layering, and a layering that lives only in
+convention erodes one convenient import at a time. Declare it as an
+[import-linter](https://import-linter.readthedocs.io/) contract and run it
+with the rest of the checks:
+
+```toml
+[tool.importlinter]
+root_package = "mytool"
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture"
+type = "layers"
+layers = ["mytool.__main__", "mytool.commands", "mytool.core", "mytool.models"]
+
+[[tool.importlinter.contracts]]
+name = "Command modules are independent"
+type = "independence"
+modules = ["mytool.commands.*"]
+```
+
+Business logic importing the argparse layer, or one command module
+reaching into a sibling's internals, is then a CI failure rather than a
+review catch. This is the module-level expression of the boundary
+principle: lower layers know nothing of what sits above them, and sibling
+commands cannot couple to each other. Code two commands both need lives
+one layer down, imported by both — never in one command, imported by the
+other.
 
 ### Streams, not files
 
@@ -263,6 +323,74 @@ covers the rest.
 - **cattrs** for (de)serialization of config files into these models —
   parsing and validation stay declarative.
 
+### Precision: beyond containers
+
+Frozen, validated objects are the foundation, but immutability only
+prevents _corruption_ of state — it does not prevent _confusion_ of state.
+The type checker can only reject what the types distinguish. Four
+instruments close the gap:
+
+- **Distinct types for domain primitives.** A job name, a stage name, and
+  a checksum are all `str` to the runtime — they must not all be `str` to
+  the type checker, or a function taking two of them will eventually be
+  called with the arguments swapped, silently. `typing.NewType` is free at
+  runtime and makes the confusion a type error:
+
+  ```python
+  JobName = typing.NewType("JobName", str)
+  StageName = typing.NewType("StageName", str)
+
+  def run_job(name: JobName) -> int: ...
+  ```
+
+  Mint the domain type at the boundary — where the Context is built or the
+  record is deserialized — and pass bare `str` nowhere.
+
+- **Tagged unions, not optional-field combinations.** A class with several
+  `X | None` fields where only certain combinations are valid is the most
+  common way invalid states stay representable. Model the alternatives as
+  a union of frozen classes and let `match` take them apart:
+
+  ```python
+  @attrs.frozen
+  class RunJob:
+      job: JobName
+
+  @attrs.frozen
+  class RunStage:
+      stage: StageName
+      jobs: frozenset[JobName]
+
+  Target = RunJob | RunStage
+  ```
+
+  Each variant carries exactly the fields valid for it. No
+  `assert ctx.stage is not None` appears downstream, because there is
+  nothing to assert.
+
+- **Exhaustive `match` with `assert_never`.** Every `match` over a union
+  or enum ends with a default arm calling `typing.assert_never`:
+
+  ```python
+  match target:
+      case RunJob(job=job): ...
+      case RunStage(stage=stage, jobs=jobs): ...
+      case unreachable:
+          typing.assert_never(unreachable)
+  ```
+
+  Adding a variant then fails the type check at every `match` that does
+  not yet handle it — the checker finds the sites a new feature must
+  touch, instead of a runtime surprise finding them later.
+
+- **`Any` is a hole in the hull.** One `Any` silently disables checking
+  for everything it flows into, downstream of the annotation. It may
+  appear only at deserialization edges — the raw object a parser hands
+  back — and must be converted to a precise type in the same function.
+  mypy's strict mode enforces most of this; an untyped third-party
+  library is wrapped behind a small typed facade rather than allowed to
+  leak `Any` into the codebase.
+
 ### The cost of immutability, honestly
 
 Most of the feared overhead is not real: `attrs.evolve` copies _by
@@ -293,7 +421,9 @@ what lets everything downstream skip re-checking and locking.
 
 - `match`/`case` for any dispatch on shape or value — argv, enums,
   `(suffix, mode)` tuples. Prefer it over if/elif chains when there are
-  three or more arms or the arms destructure.
+  three or more arms or the arms destructure. When the subject is a union
+  or enum, the final arm is `typing.assert_never` (section 3) — except in
+  argv dispatch, where the final arm is the unknown-command error.
 - Walrus operator for check-and-bind (`if path := os.getenv(...)`).
 - `contextlib.suppress` over `try/except: pass`.
 - Boolean parameters are keyword-only (`*, exist_ok: bool`) — the `FBT`
