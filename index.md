@@ -1,10 +1,12 @@
+---
+---
 # Viking Analytics Style Guide
 
 Style guides for Viking Analytics codebases.
 
 | Language | Guide |
 |----------|-------|
-| Python   | [pyguide](pyguide.md) |
+| Python   | [pyguide](pyguide) |
 
 ## Adding a new guide
 

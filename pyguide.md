@@ -1,3 +1,6 @@
+---
+permalink: /pyguide
+---
 # Python Style Guide for Tooling
 
 This guide describes how we build Python tooling: command-line tools,
