@@ -670,9 +670,23 @@ The rules:
 - **Threads for IO, C extensions for CPU.** The GIL makes pure-Python
   CPU parallelism via threads ineffective. When CPU is the bottleneck and
   profiling proves it, push the hot loop into a C extension or call out
-  to a compiled tool — do not reach for `multiprocessing`, which brings
-  serialization, fork-safety, and shared-state problems that violate the
-  simplicity this guide aims for.
+  to a compiled tool — do not reach for `multiprocessing`. The reason is
+  not only technical (serialization, fork-safety, shared-state
+  complexity) but architectural: in the environments these tools run in,
+  your process is managed — by `xargs -P`, GNU parallel, Slurm, PBS, or
+  a similar scheduler. That scheduler decides how many copies of you run,
+  on which cores, with what resource limits. A tool that internally
+  spawns its own worker pool fights the scheduler for resources it
+  doesn't own: it makes CPU and memory usage unpredictable from the
+  outside, which is exactly what the scheduler needs to be predictable.
+  Be a good managed process — single-threaded for CPU, predictable in
+  your resource footprint — and let the orchestrator scale you.
+  Free-threading (available from Python 3.14) removes the GIL
+  constraint that was the last technical argument for
+  `multiprocessing` — but it does not change the scaling model.
+  Code should be compatible with free-threaded builds (the
+  immutability discipline from section 3 already ensures this), not
+  structured to exploit them for internal parallelism.
 - **Immutability makes concurrency safe.** The discipline from section 3
   — frozen attrs objects, frozensets, tuples — means threads sharing data
   cannot corrupt each other. This is not a coincidence; it is the
