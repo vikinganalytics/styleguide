@@ -27,7 +27,17 @@ service of them:
    fully or leaves no trace. No consumer should ever be able to observe,
    interact with, or build on the half-finished work of another system.
    This is what makes boundaries real at runtime: immutability protects
-   data in flight, atomicity protects state at rest.
+   data in flight, atomicity protects state at rest. In practice, prefer
+   not to touch the filesystem at all — read stdin, write stdout, let the
+   caller decide where state lives. When filesystem state is unavoidable,
+   the two atomic patterns are _replace_ (`tempfile` + `os.rename`) and
+   _append_ (one complete record per write, as with jsonlines). Both are
+   valid; neither is universally correct — choose based on the
+   concurrency model, not by default. Append carries a life-cycle
+   obligation: a file that grows without bound will at best be silently
+   reclaimed by OS cache management and at worst cause storage pressure
+   that takes down unrelated applications sharing the same system. If
+   you choose a location and append to it, you own the cleanup strategy.
 
 Every rule below is either a consequence of these principles or a
 convention adopted for consistency (line length, jsonlines, import
@@ -59,14 +69,10 @@ by a tool decays; put rules in configuration, not in code review.
 
 - **uv** for all package management and script execution
   (`uv run`, `uv lock --locked` in CI). Never pip.
-- **ruff** for formatting _and_ linting, with a 100-character line length and
-  a broad rule set. Start from this selection and remove only with a written
-  justification:
+- **ruff** for formatting _and_ linting, with a broad rule set. Start from
+  this selection and remove only with a written justification:
 
   ```toml
-  [tool.ruff]
-  line-length = 100
-
   [tool.ruff.lint]
   extend-select = [
       'ANN', 'ARG', 'B', 'C4', 'E', 'EXE', 'F', 'FBT', 'FURB', 'I', 'ICN',
@@ -79,24 +85,41 @@ by a tool decays; put rules in configuration, not in code review.
   (e.g. `"T20"  # Print is intentional in a CLI tool`). Inline suppressions
   use the specific rule code, never a bare `# noqa`.
 
-- **mypy in strict mode** for type checking. All code is fully annotated:
-  the `ANN` ruff rules enforce that annotations are _present_; mypy
-  enforces that they _hold_. The choice of checker is deliberate, not
-  incidental: section 3's guarantees are only as strong as the checker's
-  understanding of `attrs` — mypy's attrs plugin understands `converter=`
-  and `validator=` semantics, and today no other checker verifiably does.
-  Revisit faster checkers (e.g. ty) once their attrs support is proven
-  against a test file of deliberate violations, not against release notes.
-- **import-linter** for module-boundary contracts (section 2). An
-  architecture that is enforced only by convention decays exactly the way
-  unenforced style does.
-- **vulture** for dead-code detection, with a committed allowlist file.
-- **pytest + coverage** with a high enforced floor (`--fail-under=99`).
-  Coverage that is not enforced is decorative.
+- **An attrs-compatible type checker in strict mode** for type checking.
+  All code is fully annotated: the `ANN` ruff rules enforce that
+  annotations are _present_; the type checker enforces that they _hold_.
+  Section 3's guarantees are only as strong as the checker's understanding
+  of `attrs` — it must understand `converter=` and `validator=` semantics.
+  Default to **ty** for its speed — fast feedback loops matter more than
+  marginal precision — and supplement with mypy or pyright when ty's blind
+  spots affect your model. No current checker handles attrs perfectly;
+  verify yours against a test file of deliberate violations, not against
+  release notes.
+- **import-linter** for module-boundary contracts. An architecture that is
+  enforced only by convention decays exactly the way unenforced style does.
+- **pytest + coverage** with a high enforced floor in CI. Coverage that
+  is not enforced is decorative.
 - **One runner for all checks.** Every check above is wired into a single
   job-runner configuration as a named job with a fix counterpart, so the
   full suite runs identically on a developer machine, in a git hook, and
   in CI — one command to check, one command to fix.
+
+### Dependencies and Python version
+
+**Version pinning through uv is mandatory.** Every dependency is locked to
+a specific version; `latest` is banned everywhere, for everything. An
+unpinned dependency is a build that works today and breaks tomorrow.
+
+Good hygiene is expected and required of all developers: keep dependencies
+as updated as they can be, resolve deprecation warnings promptly, and
+track upstream changes rather than letting them pile up. Stale
+dependencies accumulate security and compatibility debt that compounds
+faster than it seems.
+
+**Target the Python version one minor behind the latest release** (e.g.
+3.14 while 3.15 gets its first year to stabilize). This gives the
+ecosystem — type checkers, attrs, key libraries — time to catch up while
+keeping us close to the leading edge.
 
 ## 2. Program structure
 
@@ -118,31 +141,65 @@ Rules:
 - **Dispatch with structural pattern matching.** `case ["run", *args]:` reads
   as the grammar it implements, and keeps the full command grammar visible
   in one place.
-- **Each command is a module satisfying a `Protocol`**, not a registration in
-  a framework:
+- **Each command is a module exporting two functions** — not a class, not a
+  registration in a framework:
 
   ```python
-  class Module(Protocol):
-      @staticmethod
-      def parse_args(args: Sequence[str]) -> Context: ...
-      @staticmethod
-      def main(ctx: Context) -> int: ...
+  # mytool/commands/run.py
+  def parse_args(args: Sequence[str]) -> Context: ...
+  def main(ctx: Context) -> int: ...
   ```
+
+  The dispatch in `__main__.py` imports the module and calls its functions
+  directly. The shape is a convention enforced by usage, not by a `Protocol`
+  — mypy cannot check that a module satisfies a structural type, so a
+  `Protocol` here would be decorative.
 
   When a tool owns a _resource_ — a cache, a connection — it appears as an
   explicit parameter (`main(cache, ctx)`): opened at the entry point and
-  injected (section 7), never reached for globally. Resources are the
+  injected (section 6), never reached for globally. Resources are the
   deliberate exception to the immutability rules of section 3 — stateful by
   nature, which is exactly why they are singular and passed visibly. But add
   such a parameter when the tool actually acquires the resource, not
-  speculatively (section 10).
+  speculatively (section 8).
 
 - **The `argparse.Namespace` never leaves `parse_args`.** It is converted
   field-by-field into a frozen `attrs` Context immediately. Business logic
   never sees argv, a Namespace, or a dict of options.
 - **Shared flags are defined once**, in a central `Argument` enum plus an
   `add_argument(parser, argument)` dispatcher, so `--quiet` or `--repo-path`
-  cannot drift between subcommands.
+  cannot drift between subcommands:
+
+  ```python
+  # mytool/args.py
+  class Argument(Enum):
+      REPO_PATH = "--repo-path"
+      QUIET = "--quiet"
+      MAX_JOBS = "--max-jobs"
+
+  def add_argument(parser: argparse.ArgumentParser, argument: Argument) -> argparse.Action:
+      match argument:
+          case Argument.REPO_PATH:
+              return parser.add_argument(
+                  "--repo-path", "-r",
+                  type=lambda path: Path(path).resolve(),
+                  default=Path.cwd(),
+              )
+          case Argument.QUIET:
+              return parser.add_argument(
+                  "--quiet", "-q",
+                  action="append_const", const=1,
+              )
+          case Argument.MAX_JOBS:
+              return parser.add_argument(
+                  "-n", "--max-jobs",
+                  type=int, default=0,
+              )
+      raise ValueError(f"Unknown argument: {argument}")  # unreachable; satisfies the type checker
+  ```
+
+  Each command's `parse_args` calls `add_argument` for the flags it needs;
+  the definition stays in one place.
 - **`main` returns an exit code**; only the top-level entry point calls
   `sys.exit`.
 
@@ -156,31 +213,13 @@ that.
 
 The pipeline above implies a layering, and a layering that lives only in
 convention erodes one convenient import at a time. Declare it as an
-[import-linter](https://import-linter.readthedocs.io/) contract and run it
-with the rest of the checks:
-
-```toml
-[tool.importlinter]
-root_package = "mytool"
-
-[[tool.importlinter.contracts]]
-name = "Layered architecture"
-type = "layers"
-layers = ["mytool.__main__", "mytool.commands", "mytool.core", "mytool.models"]
-
-[[tool.importlinter.contracts]]
-name = "Command modules are independent"
-type = "independence"
-modules = ["mytool.commands.*"]
-```
-
-Business logic importing the argparse layer, or one command module
-reaching into a sibling's internals, is then a CI failure rather than a
-review catch. This is the module-level expression of the boundary
-principle: lower layers know nothing of what sits above them, and sibling
-commands cannot couple to each other. Code two commands both need lives
-one layer down, imported by both — never in one command, imported by the
-other.
+[import-linter](https://import-linter.readthedocs.io/) contract and run
+it with the rest of the checks — business logic importing the argparse
+layer, or one command module reaching into a sibling's internals, is then
+a CI failure rather than a review catch. Lower layers know nothing of
+what sits above them, and sibling commands cannot couple to each other.
+Code two commands both need lives one layer down, imported by both —
+never in one command, imported by the other.
 
 ### Streams, not files
 
@@ -195,12 +234,30 @@ In practice this means a bare `print()` is reserved for data; everything
 user-facing is `print(..., file=sys.stderr)` (this is also why the `T20`
 lint rule is ignored for CLI tools).
 
-For stdin and stdout, go a step further: **jsonlines is the highly
-encouraged format**. One JSON object per line composes with the entire Unix
-toolbox (`jq`, `grep`, `head`, pipes between tools) and parses
-unambiguously. Records arriving on stdin are input like any other: they
-cross the same validated boundary as argv — deserialized (cattrs) into
-frozen, validated models before business logic sees them.
+For stdout, **jsonlines is the encouraged machine-readable format**. One
+JSON object per line composes with the entire Unix toolbox (`jq`, `grep`,
+`head`, pipes between tools) and parses unambiguously. Critically,
+jsonlines is naturally streamable: each record is written the moment it is
+ready. This steers program design toward "do work a little bit at a time,
+yield bits of output when you've made progress" rather than "build one
+massive data structure and dump it at the end." The streaming model keeps
+the program's memory footprint low, avoids holding a file open for a long
+time, and means that incomplete work is never silently lost when a process
+is interrupted — everything flushed so far is already on disk. A plain
+JSON array would actively fight this pattern.
+
+Records arriving on stdin are input like any other: they cross the same
+validated boundary as argv — deserialized (cattrs) into frozen, validated
+models before business logic sees them.
+
+**Human-readable output** is sometimes the right choice — but keep it
+parseable. Avoid emojis, Unicode box-drawing, and characters that render
+differently across terminals. Stick to ASCII that `grep` and `awk` can
+make sense of and that prints cleanly everywhere. When a tool supports
+both modes, provide a flag (e.g. `--format=json|text`) and an output
+abstraction: a small function or class that takes the attrs model
+representing a result and formats it in the selected mode. Business logic
+produces the model; the formatter decides the presentation.
 
 Do not force a filesystem dependency on the user. Paths on disk are shared
 mutable state — they race, easily, in exactly the way section 3 teaches us
@@ -239,15 +296,19 @@ with what we hand out. Two consequences follow on the consuming side:
 The same frame governs producers, and it is what drives handing out
 immutable structures and views in the first place: if the type you expose
 makes mutation possible, assume some consumer will eventually mutate it —
-and your internal state along with it. Since consumers do not trust
-iteration order anyway, there is also rarely a reason to hand out a list:
-prefer sets, annotate parameters as `Collection`, and — since we always
-want the immutable version — that lands on `frozenset` all over the place.
-(`Sequence` remains the right annotation when order _is part of the
-meaning_ — argv, an ordered pipeline of stages.) The usual pushback is
-"this element isn't hashable, so it can't go in a set"; ask _why_ it isn't
-hashable, and the answer is almost always a mutable field — which violates
-the immutability principle and should be fixed, not worked around.
+and your internal state along with it. Choose the immutable collection
+that fits the data: `frozenset` when the collection is unordered and
+elements should be unique (a set of job names, a set of file paths to
+watch); `tuple` when order matters or duplicates are meaningful;
+`Mapping` (backed by a dict) when you need key-value lookup. Don't reach
+for `frozenset` by default when a tuple or Mapping would be a more
+natural fit — the goal is immutability, not a specific container. Annotate
+parameters with the abstract type that communicates what you need:
+`Collection` when you only iterate, `Sequence` when order is part of the
+meaning (argv, an ordered pipeline of stages). The usual pushback on sets
+is "this element isn't hashable, so it can't go in a set"; ask _why_ it
+isn't hashable, and the answer is almost always a mutable field — which
+violates the immutability principle and should be fixed, not worked around.
 
 Note what the concern actually is: **sharing mutable state with code you
 don't control.** And "code you don't control" is broader than it sounds.
@@ -268,7 +329,9 @@ returning a dict annotated as `Mapping` does not make the dict immutable —
 it makes mutating it a type error, which has teeth only because the type
 checker is mandatory (section 1). Runtime immutability (`frozenset`,
 tuples, `attrs.frozen`) is used where it is cheap; the static contract
-covers the rest.
+covers the rest. Often the best defense is not exposing a mapping at
+all — restructure so the data stays in the caller's local scope or is
+absorbed into a frozen attrs field.
 
 ### Rules
 
@@ -298,8 +361,10 @@ covers the rest.
   in. Without it, the caller may repurpose and mutate that list or dict for
   its own ends after handing it to you — and your "immutable" object now
   changes underneath you.
-- **Immutable by default.** `frozenset`, tuples, and `Mapping` return types.
-  Derive new state with `attrs.evolve(ctx, ...)`, never by mutation.
+- **Immutable by default.** Return concrete immutable types — `frozenset`,
+  `tuple`, `Mapping` — chosen to fit the data, not one container for
+  everything. Derive new state with `attrs.evolve(ctx, ...)`, never by
+  mutation.
 - **When full immutability is genuinely too expensive**, go as far as you
   can cheaply: hand consumers `dict.keys()` / `dict.values()` views rather
   than the dict itself, so they at least cannot mutate your state through
@@ -327,8 +392,18 @@ covers the rest.
   `run(cache) -> int`).
 - **Modern syntax throughout**: builtin generics (`frozenset[str]`), `X | Y`
   unions, `pathlib` exclusively for paths.
-- **cattrs** for (de)serialization of config files into these models —
-  parsing and validation stay declarative.
+- **cattrs** for (de)serialization of config files and jsonlines records
+  into these models — parsing and validation stay declarative:
+
+  ```python
+  c = cattrs.Converter()
+  c.register_structure_hook(re.Pattern, lambda obj, _: re.compile(obj))
+  config = c.structure(raw_dict, MyConfig)  # MyConfig is @attrs.frozen
+  ```
+
+  Custom hooks handle types cattrs cannot infer (compiled regexes, Path
+  objects); the converter + frozen attrs model replaces hand-written
+  parsing and field-by-field validation.
 
 ### Precision: beyond containers
 
@@ -346,7 +421,7 @@ instruments close the gap:
   def assign(*, job: str, stage: str) -> None: ...
   ```
 
-  The `FBT` rules already require this for booleans (section 5); apply
+  The `FBT` rules already require this for booleans (section 4); apply
   the same discipline whenever two or more parameters share a type.
   Mixups become visible at the call site and caught by the checker.
 
@@ -397,7 +472,7 @@ instruments close the gap:
   for everything it flows into, downstream of the annotation. It may
   appear only at deserialization edges — the raw object a parser hands
   back — and must be converted to a precise type in the same function.
-  mypy's strict mode enforces most of this; an untyped third-party
+  Strict mode enforces most of this; an untyped third-party
   library is wrapped behind a small typed facade rather than allowed to
   leak `Any` into the codebase.
 
@@ -417,17 +492,7 @@ remove _those specific_ copies or validations — never immutability
 wholesale. Until the profile says otherwise, keep the discipline; it is
 what lets everything downstream skip re-checking and locking.
 
-## 4. Imports
-
-- Absolute, module-level, fully qualified: `import mytool.models` and
-  `mytool.models.JobConfig` at the use site. Call sites are
-  self-documenting; `from x import y` is reserved for a handful of
-  highly-recognizable names.
-- Grouped stdlib / third-party / local (ruff `I` enforces this).
-- No imports inside functions (`PLC0415`) except behind an explicit
-  per-file ignore with a reason (e.g. optional dependencies).
-
-## 5. Control flow and idiom
+## 4. Control flow and idiom
 
 - `match`/`case` for any dispatch on shape or value — argv, enums,
   `(suffix, mode)` tuples. Prefer it over if/elif chains when there are
@@ -443,31 +508,15 @@ what lets everything downstream skip re-checking and locking.
 - Generators for streams of work (events, matches); the caller decides
   about collection.
 
-## 6. Errors
-
-- **A small exception hierarchy per failure domain**, each class with a
-  one-line docstring and message formatting in `__init__`:
-
-  ```python
-  class UnknownJobError(ConfigError):
-      """Job name is unknown."""
-      def __init__(self, referenced_by: str, unknown_jobs: Collection[str], available_jobs: Collection[str]) -> None:
-          super().__init__(f"Unknown jobs found in {referenced_by!r}: {sorted(unknown_jobs)}; ...")
-  ```
-
-  Callers raise with structured arguments; only the exception knows its
-  prose. Error messages include what was found _and_ what was expected or
-  available.
+## 5. Errors
 
 - **One translation point.** The top-level `main()` is the only place that
   catches domain exceptions and turns them into stderr messages and exit
   codes. Internals raise; they do not print and continue.
 - Re-raise across layers with context: catch `ValueError` from attrs
   validation and raise the domain error `from exc`.
-- Long messages inline are fine (`TRY003` is ignored) — one clear message
-  beats a proliferation of single-use exception classes.
 
-## 7. Resources and external state
+## 6. Resources and external state
 
 Resources are the primary vector for shared mutable state — and the place
 where the atomicity principle (principle 3) does its heaviest work. Every
@@ -498,57 +547,51 @@ intermediate state.
     deletion, so concurrent processes cannot clobber each other.
 - **Respect platform conventions for cache and config locations.** Code
   must be well behaved on developer laptops, and many of those are macOS.
-  Resolve the cache directory with an explicit precedence chain:
+  Getting this right is harder than it looks: the resolution must respect
+  tool-specific env vars, `XDG_CACHE_HOME`, macOS `~/Library/Caches`,
+  POSIX `~/.cache`, and a tempdir fallback — fail loudly when an
+  explicitly configured location is unusable, fall through silently when a
+  platform default is not. This is also why platform-conventional
+  locations matter: we still manage our own cache directory, but cache
+  management is hard to test robustly — and when our cleanup is buggy,
+  placing the cache where the OS or a system cache manager already
+  handles eviction gives it a way to contain the situation before it
+  becomes a critical problem for other applications on the same system. A
+  [hardened example](https://github.com/ollelindgren/cixstack/blob/main/cixstack/utils.py)
+  is available as a reference (`_get_cache_dir()`).
 
-  1. A tool-specific env var (`MYTOOL_CACHE_DIR`), if set.
-  2. `$XDG_CACHE_HOME/mytool`, if set.
-  3. `~/Library/Caches/mytool` on macOS (`sys.platform == "darwin"`).
-  4. `~/.cache/mytool` on other POSIX systems.
-  5. A directory under `tempfile.gettempdir()` as a last resort, with a
-     warning to stderr.
-
-  Check writability (`os.access(..., os.W_OK)`) before settling on a
-  candidate — a heuristic, so still handle `OSError` at use time — and fail
-  loudly, rather than falling through, when an _explicitly configured_
-  location (steps 1–2) is unusable: the user asked for that location, so
-  silently caching elsewhere is a bug.
-
-  Resolve the chain once, in the entry point, and pass the result down —
-  through the Context or as a parameter — rather than into a module-level
-  constant. Resolved-at-import globals are hidden shared state like any
-  other, and they force tests to patch what they should be able to inject.
+  Resolve the cache directory once, in the entry point, and pass the
+  result down — through the Context or as a parameter — rather than into
+  a module-level constant. Resolved-at-import globals are hidden shared
+  state like any other, and they force tests to patch what they should be
+  able to inject.
 
 - Partition on-disk formats by anything that breaks compatibility (e.g.
   pickle caches keyed by Python minor version).
 
-## 8. Comments and docstrings
-
-- **Comments explain _why_, never _what_.** Platform quirks, performance
-  constraints ("very hot loop, attribute lookup gets expensive"),
-  ordering requirements, chicken-and-egg gotchas. If a comment restates the
-  code, delete it.
-- **Docstrings are sparse in source code.** Types, names, and structure
-  carry the meaning; a one-line docstring on exception classes and genuinely
-  non-obvious functions is enough. (Tests are the exception — see below.)
-- Suppressions are surgical: `# noqa: S311` with the specific code, ideally
-  with a trailing reason.
-
-## 9. Testing
+## 7. Testing
 
 - **pytest**, with `tmp_path` for filesystem work. Because resources and
-  locations are injected (section 7), tests rarely need patching at all:
+  locations are injected (section 6), tests rarely need patching at all:
   hand in `{}` for the cache, `tmp_path` for the cache directory. Reaching
   for `unittest.mock.patch` is a signal that something should have been
   injected — and never monkeypatch internals of the unit under test.
 - **Parametrize aggressively** (`@pytest.mark.parametrize` with tuple-style
   argnames) instead of copy-pasted test bodies.
-- **Every test gets a one-line docstring** stating the behavior under test.
+- **Every test gets a docstring** explaining _what_ is being tested and
+  _why_ that justifies a test — the bug it guards against, the invariant
+  it enforces, or the assumption it validates. One line is often not
+  enough; a sentence or two of context is better than a vague summary.
+  The docstring exists to prevent a future maintainer from rewriting the
+  test to pass when it fails: if the purpose isn't clear, the path of
+  least resistance is to make the failure go away — potentially
+  re-introducing the exact bug the original author thought to check for.
 - **Property-based/fuzz tests with hypothesis** for parsers and anything
   that consumes arbitrary user input.
 - Coverage is enforced in CI at a high floor; test against the public
   behavior (files written, exit codes, output), not private call sequences.
 
-## 10. What _not_ to copy
+## 8. What _not_ to copy
 
 Some tools — job runners, daemons, anything supervising concurrent
 processes — have domains that force a density of edge-case handling:
