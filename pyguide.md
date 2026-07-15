@@ -327,24 +327,21 @@ covers the rest.
 
 Frozen, validated objects are the foundation, but immutability only
 prevents _corruption_ of state — it does not prevent _confusion_ of state.
-The type checker can only reject what the types distinguish. Four
+The type checker can only reject what the types distinguish. Three
 instruments close the gap:
 
-- **Distinct types for domain primitives.** A job name, a stage name, and
-  a checksum are all `str` to the runtime — they must not all be `str` to
-  the type checker, or a function taking two of them will eventually be
-  called with the arguments swapped, silently. `typing.NewType` is free at
-  runtime and makes the confusion a type error:
+- **Keyword-only args when types collide.** A function taking two `str`
+  positionals — say a job name and a stage name — will eventually be
+  called with the arguments swapped, silently. Force the caller to name
+  them:
 
   ```python
-  JobName = typing.NewType("JobName", str)
-  StageName = typing.NewType("StageName", str)
-
-  def run_job(name: JobName) -> int: ...
+  def assign(*, job: str, stage: str) -> None: ...
   ```
 
-  Mint the domain type at the boundary — where the Context is built or the
-  record is deserialized — and pass bare `str` nowhere.
+  The `FBT` rules already require this for booleans (section 5); apply
+  the same discipline whenever two or more parameters share a type.
+  Mixups become visible at the call site and caught by the checker.
 
 - **Tagged unions, not optional-field combinations.** A class with several
   `X | None` fields where only certain combinations are valid is the most
@@ -354,12 +351,12 @@ instruments close the gap:
   ```python
   @attrs.frozen
   class RunJob:
-      job: JobName
+      job: str
 
   @attrs.frozen
   class RunStage:
-      stage: StageName
-      jobs: frozenset[JobName]
+      stage: str
+      jobs: frozenset[str]
 
   Target = RunJob | RunStage
   ```
@@ -427,7 +424,9 @@ what lets everything downstream skip re-checking and locking.
 - Walrus operator for check-and-bind (`if path := os.getenv(...)`).
 - `contextlib.suppress` over `try/except: pass`.
 - Boolean parameters are keyword-only (`*, exist_ok: bool`) — the `FBT`
-  rules enforce this.
+  rules enforce this. The same applies when two or more parameters share a
+  type (section 3): `assign(*, job: str, stage: str)` prevents silent
+  mixups that positional arguments allow.
 - Generators for streams of work (events, matches); the caller decides
   about collection.
 
