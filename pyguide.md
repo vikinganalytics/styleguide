@@ -451,12 +451,24 @@ absorbed into a frozen attrs field.
   visible. A validator at construction makes it visible; permissiveness
   buries it.
 
-- **Converters are defensive copies, not just coercion.** A
-  `converter=frozenset` on a field does two jobs: it normalizes the type,
-  and it severs the object from whatever mutable structure the caller passed
-  in. Without it, the caller may repurpose and mutate that list or dict for
-  its own ends after handing it to you — and your "immutable" object now
-  changes underneath you.
+- **Converters make strict boundaries ergonomic.** Validators enforce
+  that the class's assumptions hold — but without converters, every
+  caller must construct exactly the type the field demands. That burden
+  pushes back against strictness: "why does this need a
+  `tuple[Path, ...]`, can't I just pass my list of strings?" The caller
+  is not wrong to ask. Converters let you have it both ways: the caller
+  presents something easily constructed, and the converter narrows it
+  into the exact representation the class needs. A converter chain like
+  `converter=[partial(map, Path), dict.fromkeys, tuple]` accepts a
+  bare list of strings — the kind a call to `git ls-files` produces —
+  and delivers a deduplicated tuple of resolved paths. The field is
+  strict; the interface is forgiving.
+
+  Converters also serve as **defensive copies**. A `converter=frozenset`
+  severs the object from whatever mutable structure the caller passed
+  in. Without it, the caller may repurpose and mutate that list or dict
+  for its own ends after handing it to you — and your "immutable" object
+  now changes underneath you.
 - **Immutable by default.** Return concrete immutable types — `frozenset`,
   `tuple`, `Mapping` — chosen to fit the data, not one container for
   everything. Derive new state with `attrs.evolve(ctx, ...)`, never by
