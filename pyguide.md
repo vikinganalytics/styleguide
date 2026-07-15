@@ -344,11 +344,10 @@ instruments close the gap:
   Mixups become visible at the call site and caught by the checker.
 
 - **Enums for closed sets of values.** When a string parameter has a
-  discrete, known set of valid values, model it as an `enum.Enum` (or
-  `enum.StrEnum` when the string value matters at serialization
-  boundaries). The type checker then rejects typos and invalid values
-  statically, and `cattrs` structures them natively — no custom hooks
-  needed. Reserve bare `str` for values that are genuinely open-ended.
+  discrete, known set of valid values, model it as an `enum.Enum`. The
+  type checker then rejects typos and invalid values statically, and
+  `cattrs` structures them natively — no custom hooks needed. Reserve
+  bare `str` for values that are genuinely open-ended.
 
 - **Tagged unions, not optional-field combinations.** A class with several
   `X | None` fields where only certain combinations are valid is the most
