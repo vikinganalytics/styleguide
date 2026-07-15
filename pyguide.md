@@ -39,6 +39,34 @@ service of them:
    that takes down unrelated applications sharing the same system. If
    you choose a location and append to it, you own the cleanup strategy.
 
+### Design goal: one binary, every environment
+
+These tools must behave identically in three settings:
+
+1. **A developer laptop** (macOS, Ubuntu, or WSL) — interactive use,
+   quick iteration, a single invocation at a time.
+2. **A VM or HPC node** — manual or scripted runs on shared
+   infrastructure, often with a shared filesystem.
+3. **Scaled-out execution** — hundreds or thousands of concurrent
+   invocations managed by an HPC scheduler (Slurm, PBS), an OS-level
+   orchestrator (`xargs -P`, GNU parallel), or a job runner.
+
+The same program, unchanged, must be correct in all three — and
+correctness in any one setting must be sufficient evidence of
+correctness in the others. If a tool passes its tests on a laptop, that
+must be enough to release it with confidence; no one should need to
+provision a cluster-scale environment to answer "is this safe to
+deploy." Conversely, a Saturday-evening run on shared infrastructure
+should never surface a bug that a developer could have caught locally.
+That mutual guarantee is what makes the principles above non-negotiable:
+immutability and atomicity prevent the corruption that surfaces only
+under concurrency; strong boundaries keep a tool's footprint predictable
+so a scheduler can manage it; stdin/stdout composability lets an
+orchestrator wire tools together without the tools needing to know they
+are being orchestrated. A tool that works on a laptop but requires a
+special "cluster mode," or one that is only safe under light load, has
+failed the design goal.
+
 Every rule below is either a consequence of these principles or a
 convention adopted for consistency (line length, jsonlines, import
 grouping). The distinction matters in review: a deviation that weakens a
@@ -397,9 +425,31 @@ absorbed into a frozen attrs field.
   ```
 
   Coercion and validation happen at construction, once. After that, the
-  object is trusted everywhere — no re-checking downstream. This is the main
-  mechanism that prevents whole classes of bugs: invalid states are
-  unrepresentable rather than handled.
+  object is trusted everywhere — no re-checking downstream. Everything
+  the rest of the program does — every branch, every output format,
+  every edge case it handles or deliberately doesn't — rests on
+  assumptions about the data that passed through this boundary. The
+  validator's job is to enforce those assumptions exhaustively, so that
+  data the program was never designed for cannot silently enter and
+  travel through code that was never tested against it.
+
+  This is where developer instinct most commonly fails the design.
+  Rejecting data feels harsh — "the caller might have a reason for
+  passing this." That instinct is not wrong: the caller's use case may
+  be perfectly valid. But if the data does not match what the program
+  was built, tested, and reasoned about, then the program does not
+  actually serve that use case — it only appears to, until it doesn't.
+  The validator makes the mismatch visible at the earliest possible
+  moment, so the user can act on it: pass different data, file a
+  feature request, use a previous version, or choose another tool.
+  Without the validator, the same mismatch still exists — it just
+  surfaces three layers deeper as a confusing `KeyError` or a silently
+  wrong result, pointing nowhere near the actual problem and giving no
+  one — neither the user nor the maintainer — the information they need
+  to act. When assumptions about the data an application handles stop
+  holding, it is critical for everyone involved that the gap is
+  visible. A validator at construction makes it visible; permissiveness
+  buries it.
 
 - **Converters are defensive copies, not just coercion.** A
   `converter=frozenset` on a field does two jobs: it normalizes the type,
