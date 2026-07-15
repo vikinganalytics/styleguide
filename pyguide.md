@@ -327,7 +327,7 @@ covers the rest.
 
 Frozen, validated objects are the foundation, but immutability only
 prevents _corruption_ of state — it does not prevent _confusion_ of state.
-The type checker can only reject what the types distinguish. Three
+The type checker can only reject what the types distinguish. Four
 instruments close the gap:
 
 - **Keyword-only args when types collide.** A function taking two `str`
@@ -342,6 +342,13 @@ instruments close the gap:
   The `FBT` rules already require this for booleans (section 5); apply
   the same discipline whenever two or more parameters share a type.
   Mixups become visible at the call site and caught by the checker.
+
+- **Enums for closed sets of values.** When a string parameter has a
+  discrete, known set of valid values, model it as an `enum.Enum` (or
+  `enum.StrEnum` when the string value matters at serialization
+  boundaries). The type checker then rejects typos and invalid values
+  statically, and `cattrs` structures them natively — no custom hooks
+  needed. Reserve bare `str` for values that are genuinely open-ended.
 
 - **Tagged unions, not optional-field combinations.** A class with several
   `X | None` fields where only certain combinations are valid is the most
