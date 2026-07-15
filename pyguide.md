@@ -10,8 +10,8 @@ than by defensive handling.
 
 ## Principles
 
-Two principles are the point of this guide; everything else is in service
-of them:
+Three principles are the point of this guide; everything else is in
+service of them:
 
 1. **A robust type system, so that bugs cannot be represented.** The best
    error handling is a state that cannot be constructed. Invariants are
@@ -21,6 +21,13 @@ of them:
    be able to interfere with each other in unintended or counterintuitive
    ways — and when something messy sneaks in anyway, despite our best
    intentions, the blast radius stays contained on one side of a boundary.
+3. **Atomic side effects, so that incomplete work is never observable.**
+   Every operation that changes state visible to another part of the
+   system — a file, a cache entry, an external record — either completes
+   fully or leaves no trace. No consumer should ever be able to observe,
+   interact with, or build on the half-finished work of another system.
+   This is what makes boundaries real at runtime: immutability protects
+   data in flight, atomicity protects state at rest.
 
 Every rule below is either a consequence of these principles or a
 convention adopted for consistency (line length, jsonlines, import
@@ -327,7 +334,7 @@ covers the rest.
 
 Frozen, validated objects are the foundation, but immutability only
 prevents _corruption_ of state — it does not prevent _confusion_ of state.
-The type checker can only reject what the types distinguish. Four
+The type checker can only reject what the types distinguish. Five
 instruments close the gap:
 
 - **Keyword-only args when types collide.** A function taking two `str`
@@ -461,6 +468,11 @@ what lets everything downstream skip re-checking and locking.
   beats a proliferation of single-use exception classes.
 
 ## 7. Resources and external state
+
+Resources are the primary vector for shared mutable state — and the place
+where the atomicity principle (principle 3) does its heaviest work. Every
+rule below exists to ensure that no consumer ever sees an operation's
+intermediate state.
 
 - **Open once at the top, inject downward, close in one place.** The process
   entry point owns the resource lifetime (`with diskcache.Cache(...) as cache:`);
