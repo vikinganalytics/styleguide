@@ -627,6 +627,58 @@ what lets everything downstream skip re-checking and locking.
 - Re-raise across layers with context: catch `ValueError` from attrs
   validation and raise the domain error `from exc`.
 
+### Retries
+
+**A tool that fails exits with a nonzero code. The caller decides whether
+to retry.** This is the retry equivalent of the scaling model (section 8):
+be a good managed process. A Slurm job that fails gets resubmitted by
+the scheduler; a shell pipeline reruns the failed step; a human reads
+the error and acts. Internal retry loops hide failures from the
+orchestrator, make resource usage unpredictable from the outside, and
+turn a clear "this failed" into an opaque hang.
+
+The exception is **transient failure within a single logical
+operation** — an HTTP request to a flaky endpoint, a connection that
+drops mid-handshake. The caller cannot meaningfully retry a sub-step it
+does not know about, so bounded retries with backoff are justified here.
+Use **[tenacity](https://tenacity.readthedocs.io/)** — not hand-rolled
+loops. The rules:
+
+- **Bounded.** A small, fixed limit (`stop=stop_after_attempt(5)`).
+  Never indefinite, never configurable without a hard ceiling.
+- **Backoff.** Exponential or jittered delay (`wait=wait_exponential()`).
+  Immediate retries against a struggling service make the problem worse.
+- **Surfaced.** If retries are exhausted, the failure propagates as a
+  normal exception (`reraise=True`) — the caller sees the same clear
+  error it would have seen without retries, just delayed. Never
+  swallowed, never logged and continued.
+- **Logged.** Each retry attempt is logged at `WARNING`
+  (`before_sleep=before_sleep_log(logger, logging.WARNING)`) so that
+  operators can distinguish "succeeded after two retries" from
+  "succeeded on the first try" — the former is often an early signal of
+  a degrading dependency.
+
+A typical site looks like this:
+
+```python
+import tenacity
+
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential(multiplier=1, max=30),
+    reraise=True,
+    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+)
+def _fetch(url: str) -> bytes: ...
+```
+
+If you find yourself decorating many functions with retry logic, the
+problem is not that retries are too verbose — it is that the tool is
+doing too much. A tool that makes one HTTP call and processes the result
+needs one retry site. A tool that orchestrates a dozen network calls is
+a workflow engine and should be designed as one, not papered over with
+`@retry` decorators.
+
 ## 6. Resources and external state
 
 Resources are the primary vector for shared mutable state — and the place
@@ -677,6 +729,15 @@ intermediate state.
   state like any other, and they force tests to patch what they should be
   able to inject.
 
+- **Least privilege toward external resources.** The immutability
+  principle applies beyond data structures: do not acquire capabilities
+  you will not use. Use read-only credentials when the tool only reads.
+  Hit a read replica when the tool does not need consistency guarantees
+  from the primary. Call the narrowest API scope that covers the
+  operation. The reasoning is the same as returning a `Mapping` instead
+  of a `dict`: if the tool cannot write, it cannot corrupt — and the
+  failure mode where a read-only tool accidentally mutates shared state
+  becomes unrepresentable.
 - Partition on-disk formats by anything that breaks compatibility (e.g.
   pickle caches keyed by Python minor version).
 
