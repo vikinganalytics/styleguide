@@ -91,10 +91,10 @@ by a tool decays; put rules in configuration, not in code review.
   Section 3's guarantees are only as strong as the checker's understanding
   of `attrs` — it must understand `converter=` and `validator=` semantics.
   Default to **ty** for its speed — fast feedback loops matter more than
-  marginal precision — and supplement with mypy or pyright when ty's blind
-  spots affect your model. No current checker handles attrs perfectly;
-  verify yours against a test file of deliberate violations, not against
-  release notes.
+  marginal precision. In practice the gap is small — roughly one
+  `type: ignore` per 500 lines — and well worth the faster iteration
+  cycle. Verify against a test file of deliberate violations committed
+  to the repo, not against release notes.
 - **import-linter** for module-boundary contracts. An architecture that is
   enforced only by convention decays exactly the way unenforced style does.
 - **pytest + coverage** with a high enforced floor in CI. Coverage that
@@ -271,6 +271,47 @@ uv run tool.py < input.jsonl > output.jsonl
 Accepting a path argument is an occasionally-justified convenience;
 _requiring_ one is a design smell.
 
+### Logging
+
+All log output goes to stderr — stdout is for data (see above). Use the
+stdlib `logging` module, one logger per module:
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+```
+
+**Logging must be configurable without code changes.** Load configuration
+from a file (`logging.config.dictConfig` from a JSON/TOML file, or
+`logging.config.fileConfig`) at the entry point, resolved once alongside
+the rest of the program's configuration. When an overly verbose library
+or subsystem is drowning useful output, an operator must be able to set
+`mypackage.noisy_module` to `WARNING` in a config file and restart —
+without a code change, a review, or a deploy.
+
+Rules:
+
+- **Never configure logging at import time.** No module-level
+  `logging.basicConfig()`, no `handler.setLevel()` scattered across
+  files. The entry point owns the configuration; everything else just
+  calls `logger.debug/info/warning/error`.
+- **Use log levels consistently.** `DEBUG` for internal state useful when
+  diagnosing; `INFO` for operational milestones (started, finished,
+  skipped); `WARNING` for recoverable surprises; `ERROR` for failures the
+  tool will report via exit code. Do not log at `INFO` what should be
+  `DEBUG` — when thousands of instances run in parallel, `INFO` that is
+  really `DEBUG` becomes noise that obscures real problems.
+- **Structured fields over f-strings in log messages.** Prefer
+  `logger.info("processed %d records from %s", count, source)` over
+  `logger.info(f"processed {count} records from {source}")` — the former
+  lets structured formatters (JSON log handlers) extract fields without
+  parsing, and defers string formatting to when the message is actually
+  emitted (which matters at `DEBUG` level when debug logging is off).
+- **A default configuration ships with the tool** so that it works
+  without a config file — typically `WARNING` to stderr. The config file
+  _overrides_ the default; its absence is not an error.
+
 ## 3. Data and types
 
 ### The outside world is untrusted
@@ -337,8 +378,13 @@ absorbed into a frozen attrs field.
 
 - **`attrs`, not dataclasses.** Dataclasses have neither converters nor
   validators, so they cannot implement the validated-boundary pattern this
-  guide rests on. Boundary objects are `@attrs.frozen` with `converter=`
-  and `validator=` on every field:
+  guide rests on. Two exceptions exist: (1) the tool must run on system
+  Python across a wide range of machines with truly zero third-party
+  dependencies — a single-file stdlib-only script, not a normal
+  distribution; (2) profiling has proven that attrs construction overhead
+  is the bottleneck, and dataclasses measurably resolve it. Both cases are
+  rare; neither should be assumed up front. Boundary objects are
+  `@attrs.frozen` with `converter=` and `validator=` on every field:
 
   ```python
   @attrs.frozen
@@ -403,7 +449,10 @@ absorbed into a frozen attrs field.
 
   Custom hooks handle types cattrs cannot infer (compiled regexes, Path
   objects); the converter + frozen attrs model replaces hand-written
-  parsing and field-by-field validation.
+  parsing and field-by-field validation. This is the extent of what cattrs
+  requires in practice — see the
+  [cattrs documentation](https://catt.rs/en/stable/) for the full hook
+  API when the defaults are not enough.
 
 ### Precision: beyond containers
 
@@ -591,7 +640,68 @@ intermediate state.
 - Coverage is enforced in CI at a high floor; test against the public
   behavior (files written, exit codes, output), not private call sequences.
 
-## 8. What _not_ to copy
+## 8. Concurrency
+
+### The scaling model: more instances, not more threads
+
+When a tool needs to go faster or handle more work, the answer is
+running more instances of the program in parallel — not making a single
+instance internally concurrent. Each instance reads its own input, writes
+its own output, and exits. The orchestrator (a shell loop, a job
+scheduler, `xargs -P`) decides the parallelism.
+
+This has a direct consequence for how you write your tool: **design for
+single-process correctness first.** Stdin/stdout composability,
+idempotent operations, and atomic filesystem writes (section 6) are what
+make a program safe to run as one of a thousand copies. Internal
+threading does not help if the program cannot be safely started twice in
+the same directory.
+
+### When internal concurrency is justified
+
+Sometimes a single invocation genuinely needs concurrency — a tool that
+fans out HTTP requests, or one that must overlap IO with CPU-bound work.
+The rules:
+
+- **`concurrent.futures` for IO-bound fan-out.** `ThreadPoolExecutor`
+  with an explicit `max_workers` is the default. The executor is created
+  at the entry point and passed down or used in a `with` block, like any
+  resource (section 6).
+- **Threads for IO, C extensions for CPU.** The GIL makes pure-Python
+  CPU parallelism via threads ineffective. When CPU is the bottleneck and
+  profiling proves it, push the hot loop into a C extension or call out
+  to a compiled tool — do not reach for `multiprocessing`, which brings
+  serialization, fork-safety, and shared-state problems that violate the
+  simplicity this guide aims for.
+- **Immutability makes concurrency safe.** The discipline from section 3
+  — frozen attrs objects, frozensets, tuples — means threads sharing data
+  cannot corrupt each other. This is not a coincidence; it is the
+  payoff. Mutable shared state between threads requires a lock, and a
+  lock you forgot is a bug you find in production under load.
+
+### Async
+
+`asyncio` is permitted but not preferred. It is the right tool when the
+program is fundamentally an event loop — many concurrent connections, a
+long-lived server — and the wrong tool when `concurrent.futures` would
+do. Do not introduce `async`/`await` for a handful of parallel HTTP
+calls that a thread pool handles cleanly.
+
+When async is used:
+
+- **Lint for unawaited coroutines.** Enable ruff's `RUF006` rule (or
+  equivalent) — a coroutine that is called but not awaited is silently
+  discarded, producing a bug that is invisible at the call site and
+  difficult to diagnose from symptoms alone.
+- **Do not mix sync and async IO in the same call chain.** A blocking
+  call inside an async function stalls the event loop. Use
+  `loop.run_in_executor` to push blocking work to a thread, or keep the
+  code synchronous throughout.
+- **The entry point owns the event loop.** `asyncio.run()` is called
+  once, at the top. No library code calls `asyncio.run()` or
+  `loop.run_until_complete()`.
+
+## 9. What _not_ to copy
 
 Some tools — job runners, daemons, anything supervising concurrent
 processes — have domains that force a density of edge-case handling:
