@@ -481,7 +481,16 @@ absorbed into a frozen attrs field.
   iteration order, so determinism is _produced at the output point_, not
   stored in the structure: `sorted(...)` wherever order reaches a user —
   serialized output, error messages, display.
-- **Annotate what you need — not necessarily what you know you'll be
+- **Every parameter, return type, and assignment the checker cannot infer
+  carries an explicit annotation.** There are no exceptions — not "it's
+  obvious," not "it's just a helper," not "it's a script." An unannotated
+  function is an unchecked function: the type checker cannot verify
+  callers, cannot catch broken refactors, and cannot propagate constraints
+  into downstream code. One missing annotation is one hole, and holes
+  compound. The `ANN` ruff rules (section 1) reject unannotated code
+  mechanically; this rule explains _why_ the linter is right to reject it.
+
+  **Annotate what you need — not necessarily what you know you'll be
   given.** Take argv: you know you will receive `sys.argv[1:]`, which is a
   `list[str]`. You need its order preserved — argv has a strong external
   convention, and nothing inside your function can reconstruct the "right"
