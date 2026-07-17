@@ -498,7 +498,13 @@ absorbed into a frozen attrs field.
   `collections.abc`; return `Sequence`, `Mapping`, or a shaped `tuple`
   when the structure matters (e.g. `tuple[str, int]`). Use `Protocol` for
   structural interfaces between layers (e.g. a `Runnable` with
-  `run(cache) -> int`).
+  `run(cache) -> int`). Always parameterize generics fully —
+  `Sequence[tuple[str, int, float | None]]`, never bare `Sequence` or
+  `Sequence[Any]`. A type that the checker cannot see through is a type
+  it cannot protect. When a precise annotation would require an import
+  that is not needed at runtime, guard it with `if TYPE_CHECKING:` — a
+  type-only dependency is not a real dependency, and is no reason to
+  leave an annotation vague.
 - **Modern syntax throughout**: builtin generics (`frozenset[str]`), `X | Y`
   unions, `pathlib` exclusively for paths.
 - **cattrs** for (de)serialization of config files and jsonlines records
