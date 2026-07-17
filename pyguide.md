@@ -495,7 +495,8 @@ absorbed into a frozen attrs field.
   `Mapping` guarantees — if it does anyway, the type checker catches it.
   **Annotations are requirements and promises, and the type checker
   verifies that everything holds.** Accept abstractions from
-  `collections.abc`; return concrete immutable types. Use `Protocol` for
+  `collections.abc`; return `Sequence`, `Mapping`, or a shaped `tuple`
+  when the structure matters (e.g. `tuple[str, int]`). Use `Protocol` for
   structural interfaces between layers (e.g. a `Runnable` with
   `run(cache) -> int`).
 - **Modern syntax throughout**: builtin generics (`frozenset[str]`), `X | Y`
