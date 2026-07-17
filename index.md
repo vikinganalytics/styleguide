@@ -7,6 +7,7 @@ Style guides for Viking Analytics codebases.
 | Language | Guide |
 |----------|-------|
 | Python   | [pyguide](pyguide) |
+| Shell    | [shellguide](shellguide) |
 
 ## Adding a new guide
 

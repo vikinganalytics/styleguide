@@ -67,6 +67,53 @@ are being orchestrated. A tool that works on a laptop but requires a
 special "cluster mode," or one that is only safe under light load, has
 failed the design goal.
 
+### Properties that emerge — not code to write
+
+The principles above, followed consistently, produce several properties
+that are critical in scheduler-managed environments where tools are
+retried, rerun, and executed in parallel. These properties are _named
+here so you can recognize when a design choice would break them_ — not
+so you add code to achieve them. The moment a developer writes
+`if is_rerun(): skip_this_step()`, the system is worse than if they
+had not tried: the branching is usually wrong about what "already done"
+means, it is hard to test, and it makes the tool harder to reason about.
+
+- **Idempotency.** A tool that reads stdin, produces deterministic
+  output, and writes via atomic replace (`tempfile` + `os.rename`) is
+  already idempotent: running it twice with the same input produces the
+  same file. No conditional logic, no "skip if exists" — the second run
+  overwrites identically. Pure stdin/stdout tools are inherently
+  rerunnable because there is no state to get confused by. If a design
+  choice would make a tool non-idempotent — appending without
+  deduplication, generating non-deterministic identifiers, depending on
+  wall-clock time — that is the signal to reconsider the design, not to
+  add rerun-detection logic.
+- **Schema evolution.** Tools that produce and consume jsonlines records
+  will, over time, add fields. The combination of `cattrs` structuring
+  with `attrs` defaults handles this naturally: a new optional field
+  with a default is backwards-compatible (old records missing the field
+  structure successfully), and unknown fields in the input are ignored
+  by default (old readers handle new records). This is not automatic
+  robustness — it requires that new fields have sensible defaults, and
+  that removed fields are deprecated through a period where they are
+  optional before being dropped. But it requires _no special code_ — the
+  existing `attrs` + `cattrs` patterns deliver it.
+- **Pipeline-level correctness.** A stdin/stdout pipeline
+  (`ingest | transform | load > output`) is already atomic at the
+  pipeline level: if any stage fails, no output is produced — the
+  final redirect or atomic replace never completes. This is a feature
+  of the model, not something extra to build. The partial-state
+  problem only arises when stages write to intermediate files between
+  invocations — which is an orchestrator-level concern, not the
+  tool's. When a workflow does require intermediate state (stages run
+  as separate jobs, not a single pipeline), the tool's responsibility
+  is to be safe to rerun: idempotent, deterministic, atomic in its
+  own writes. A workflow manager that tracks which stages completed
+  can rerun from the failed stage precisely because each tool upholds
+  these properties. Trying to solve multi-stage recovery inside the
+  tool is scope creep that produces the `is_rerun()` branching this
+  section warns against.
+
 Every rule below is either a consequence of these principles or a
 convention adopted for consistency (line length, jsonlines, import
 grouping). The distinction matters in review: a deviation that weakens a
@@ -711,6 +758,20 @@ intermediate state.
 - **Cleanup lives in `try/finally`**, including inside generators, and the
   entry point rebinds SIGINT/SIGTERM/SIGHUP to raise `KeyboardInterrupt` so
   that `finally` blocks actually run on external termination.
+- **Restore `SIGPIPE` to its default behavior** at the entry point:
+
+  ```python
+  import signal
+  signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+  ```
+
+  Python sets `SIGPIPE` to `SIG_IGN` at startup, which means writing to
+  a closed pipe raises `BrokenPipeError` instead of killing the process
+  quietly. Without this, `tool | head -5` produces a traceback after
+  `head` closes the pipe. Restoring the default makes the process die
+  silently on `SIGPIPE`, like every other Unix tool. Stdout is data and
+  pipes are the composition model — a tool that breaks when piped
+  through `head` is not composable.
 - **Treat shared filesystem state as crash-tolerant, not locked:**
   - Idempotent initialization (`mkdir(exist_ok=True)`, `touch`) at every
     startup — no "first run" special case.
