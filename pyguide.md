@@ -8,6 +8,13 @@ developer utilities, and the libraries behind them. Its goal is a design
 language that prevents common classes of errors by construction rather
 than by defensive handling.
 
+A recurring strategy throughout the guide is to **left-shift errors**:
+move detection from production to tests, from tests to the type checker,
+from the type checker to a state that cannot be constructed at all. A
+type checker that runs in seconds over the entire codebase finds
+problems you would otherwise discover in a slow test suite at best, or
+in production — or not at all — at worst.
+
 ## Principles
 
 Three principles are the point of this guide; everything else is in
@@ -668,19 +675,55 @@ what lets everything downstream skip re-checking and locking.
 
 ## 4. Control flow and idiom
 
-- `match`/`case` for any dispatch on shape or value — argv, enums,
+Every idiom in this section exists because of a specific failure mode it
+closes — not because the syntax is newer or more fashionable. The
+connecting thread is the same left-shift strategy as everywhere else:
+prefer the construct that lets the type checker or the language itself
+reject the mistake, over one that relies on the developer noticing it in
+review.
+
+- **`match`/`case` for dispatch on shape or value** — argv, enums,
   `(suffix, mode)` tuples. Prefer it over if/elif chains when there are
-  three or more arms or the arms destructure. When the subject is a union
-  or enum, the final arm is `typing.assert_never` (section 3) — except in
-  argv dispatch, where the final arm is the unknown-command error.
-- Walrus operator for check-and-bind (`if path := os.getenv(...)`).
-- `contextlib.suppress` over `try/except: pass`.
-- Boolean parameters are keyword-only (`*, exist_ok: bool`) — the `FBT`
-  rules enforce this. The same applies when two or more parameters share a
-  type (section 3): `assign(*, job: str, stage: str)` prevents silent
-  mixups that positional arguments allow.
-- Generators for streams of work (events, matches); the caller decides
-  about collection.
+  three or more arms or the arms destructure. The reason is not cosmetic:
+  `match` interacts with the type checker in a way that `if/elif` does
+  not. When the subject is a union or enum, a final `assert_never` arm
+  (section 3) turns an incomplete `match` into a type error — the checker
+  finds every site a new variant must touch, instead of an if/elif chain
+  silently falling through to a default that was never meant to handle it.
+  The exception is argv dispatch, where the final arm is the
+  unknown-command error — an open set by nature.
+
+- **Walrus operator for check-and-bind** (`if (path := os.getenv(...)):`).
+  The alternative is two statements: assign, then check. That separation
+  creates a window where the unchecked value is in scope and usable — a
+  gap between "obtained" and "validated" that the boundary philosophy
+  (section 3) exists to eliminate. The walrus closes the gap: the binding
+  only enters scope inside the branch where the check has passed. This is
+  a small instance of the same principle that drives converter-at-construction:
+  never let unvalidated data exist in a reachable name.
+
+- **`contextlib.suppress(SpecificError)` over `try/except SpecificError: pass`.**
+  A `try` block has a _spatial_ catch surface — everything between `try:`
+  and `except` is covered, including lines added later by a maintainer who
+  did not notice the exception handler. `suppress` wraps a single
+  statement, making the scope of the silencing lexically obvious and
+  resistant to scope creep. The principle is the same one behind narrow
+  type annotations: say exactly what you mean, so that accidental
+  expansion is visible.
+
+- **Generators for streams of work** (events, matches, records). A
+  function that builds a list internally and returns it has committed to
+  a representation (list), a lifecycle (everything in memory at once),
+  and a policy (all-or-nothing) on behalf of a caller who may want none
+  of those things. A generator defers all three decisions: the caller
+  collects into a list if it needs one, iterates lazily if it doesn't,
+  and can stop early without the producer finishing. This is the
+  producer-side application of the boundary principle: hand out the
+  narrowest commitment — a single-pass iterable — and let the consumer
+  choose. It also connects directly to the streaming model in section 2:
+  a tool that yields jsonlines records one at a time can flush each to
+  stdout immediately, keeping memory bounded and ensuring that work
+  completed before an interruption is never lost.
 
 ## 5. Errors
 
