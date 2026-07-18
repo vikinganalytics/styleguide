@@ -252,11 +252,11 @@ Rules:
 
   When a tool owns a _resource_ — a cache, a connection — it appears as an
   explicit parameter (`main(cache, ctx)`): opened at the entry point and
-  injected (section 6), never reached for globally. Resources are the
-  deliberate exception to the immutability rules of section 3 — stateful by
+  injected (section 9), never reached for globally. Resources are the
+  deliberate exception to the immutability rules of section 5 — stateful by
   nature, which is exactly why they are singular and passed visibly. But add
   such a parameter when the tool actually acquires the resource, not
-  speculatively (section 8).
+  speculatively (section 11).
 
 - **The `argparse.Namespace` never leaves `parse_args`.** It is converted
   field-by-field into a frozen `attrs` Context immediately. Business logic
@@ -316,7 +316,7 @@ what sits above them, and sibling commands cannot couple to each other.
 Code two commands both need lives one layer down, imported by both —
 never in one command, imported by the other.
 
-### Streams, not files
+## 3. Streams and IO
 
 Follow the Unix convention for the three standard streams:
 
@@ -355,7 +355,7 @@ representing a result and formats it in the selected mode. Business logic
 produces the model; the formatter decides the presentation.
 
 Do not force a filesystem dependency on the user. Paths on disk are shared
-mutable state — they race, easily, in exactly the way section 3 teaches us
+mutable state — they race, easily, in exactly the way section 5 teaches us
 not to trust. A tool that reads stdin and writes stdout leaves the choice
 to the user, who can still bring files when they want the statefulness:
 
@@ -366,9 +366,9 @@ uv run tool.py < input.jsonl > output.jsonl
 Accepting a path argument is an occasionally-justified convenience;
 _requiring_ one is a design smell.
 
-### Logging
+## 4. Logging
 
-All log output goes to stderr — stdout is for data (see above). Use the
+All log output goes to stderr — stdout is for data (section 3). Use the
 stdlib `logging` module, one logger per module:
 
 ```python
@@ -407,7 +407,7 @@ Rules:
   without a config file — typically `WARNING` to stderr. The config file
   _overrides_ the default; its absence is not an error.
 
-## 3. Data and types
+## 5. Data and types
 
 ### The outside world is untrusted
 
@@ -599,7 +599,7 @@ absorbed into a frozen attrs field.
   [cattrs documentation](https://catt.rs/en/stable/) for the full hook
   API when the defaults are not enough.
 
-### Precision: beyond containers
+## 6. Type precision
 
 Frozen, validated objects are the foundation, but immutability only
 prevents _corruption_ of state — it does not prevent _confusion_ of state.
@@ -615,7 +615,7 @@ instruments close the gap:
   def assign(*, job: str, stage: str) -> None: ...
   ```
 
-  The `FBT` rules already require this for booleans (section 4); apply
+  The `FBT` rules already require this for booleans (section 7); apply
   the same discipline whenever two or more parameters share a type.
   Mixups become visible at the call site and caught by the checker.
 
@@ -686,7 +686,7 @@ remove _those specific_ copies or validations — never immutability
 wholesale. Until the profile says otherwise, keep the discipline; it is
 what lets everything downstream skip re-checking and locking.
 
-## 4. Control flow and idiom
+## 7. Control flow and idiom
 
 Every idiom in this section exists because of a specific failure mode it
 closes — not because the syntax is newer or more fashionable. The
@@ -700,7 +700,7 @@ review.
   three or more arms or the arms destructure. The reason is not cosmetic:
   `match` interacts with the type checker in a way that `if/elif` does
   not. When the subject is a union or enum, a final `assert_never` arm
-  (section 3) turns an incomplete `match` into a type error — the checker
+  (section 6) turns an incomplete `match` into a type error — the checker
   finds every site a new variant must touch, instead of an if/elif chain
   silently falling through to a default that was never meant to handle it.
   The exception is argv dispatch, where the final arm is the
@@ -710,7 +710,7 @@ review.
   The alternative is two statements: assign, then check. That separation
   creates a window where the unchecked value is in scope and usable — a
   gap between "obtained" and "validated" that the boundary philosophy
-  (section 3) exists to eliminate. The walrus closes the gap: the binding
+  (section 5) exists to eliminate. The walrus closes the gap: the binding
   only enters scope inside the branch where the check has passed. This is
   a small instance of the same principle that drives converter-at-construction:
   never let unvalidated data exist in a reachable name.
@@ -733,12 +733,12 @@ review.
   and can stop early without the producer finishing. This is the
   producer-side application of the boundary principle: hand out the
   narrowest commitment — a single-pass iterable — and let the consumer
-  choose. It also connects directly to the streaming model in section 2:
+  choose. It also connects directly to the streaming model in section 3:
   a tool that yields jsonlines records one at a time can flush each to
   stdout immediately, keeping memory bounded and ensuring that work
   completed before an interruption is never lost.
 
-## 5. Errors
+## 8. Errors
 
 - **One translation point.** The top-level `main()` is the only place that
   catches domain exceptions and turns them into stderr messages and exit
@@ -749,7 +749,7 @@ review.
 ### Retries
 
 **A tool that fails exits with a nonzero code. The caller decides whether
-to retry.** This is the retry equivalent of the scaling model (section 8):
+to retry.** This is the retry equivalent of the scaling model (section 11):
 be a good managed process. A Slurm job that fails gets resubmitted by
 the scheduler; a shell pipeline reruns the failed step; a human reads
 the error and acts. Internal retry loops hide failures from the
@@ -798,7 +798,7 @@ needs one retry site. A tool that orchestrates a dozen network calls is
 a workflow engine and should be designed as one, not papered over with
 `@retry` decorators.
 
-## 6. Resources and external state
+## 9. Resources and external state
 
 Resources are the primary vector for shared mutable state — and the place
 where the atomicity principle (principle 3) does its heaviest work. Every
@@ -879,10 +879,10 @@ intermediate state.
 - Partition on-disk formats by anything that breaks compatibility (e.g.
   pickle caches keyed by Python minor version).
 
-## 7. Testing
+## 10. Testing
 
 - **pytest**, with `tmp_path` for filesystem work. Because resources and
-  locations are injected (section 6), tests rarely need patching at all:
+  locations are injected (section 9), tests rarely need patching at all:
   hand in `{}` for the cache, `tmp_path` for the cache directory. Reaching
   for `unittest.mock.patch` is a signal that something should have been
   injected — and never monkeypatch internals of the unit under test.
@@ -901,7 +901,7 @@ intermediate state.
 - Coverage is enforced in CI at a high floor; test against the public
   behavior (files written, exit codes, output), not private call sequences.
 
-## 8. Concurrency
+## 11. Concurrency
 
 ### The scaling model: more instances, not more threads
 
@@ -913,7 +913,7 @@ scheduler, `xargs -P`) decides the parallelism.
 
 This has a direct consequence for how you write your tool: **design for
 single-process correctness first.** Stdin/stdout composability,
-idempotent operations, and atomic filesystem writes (section 6) are what
+idempotent operations, and atomic filesystem writes (section 9) are what
 make a program safe to run as one of a thousand copies. Internal
 threading does not help if the program cannot be safely started twice in
 the same directory.
@@ -927,7 +927,7 @@ The rules:
 - **`concurrent.futures` for IO-bound fan-out.** `ThreadPoolExecutor`
   with an explicit `max_workers` is the default. The executor is created
   at the entry point and passed down or used in a `with` block, like any
-  resource (section 6).
+  resource (section 9).
 - **Threads for IO, C extensions for CPU.** The GIL makes pure-Python
   CPU parallelism via threads ineffective. When CPU is the bottleneck and
   profiling proves it, push the hot loop into a C extension or call out
@@ -946,9 +946,9 @@ The rules:
   constraint that was the last technical argument for
   `multiprocessing` — but it does not change the scaling model.
   Code should be compatible with free-threaded builds (the
-  immutability discipline from section 3 already ensures this), not
+  immutability discipline from section 5 already ensures this), not
   structured to exploit them for internal parallelism.
-- **Immutability makes concurrency safe.** The discipline from section 3
+- **Immutability makes concurrency safe.** The discipline from section 5
   — frozen attrs objects, frozensets, tuples — means threads sharing data
   cannot corrupt each other. This is not a coincidence; it is the
   payoff. Mutable shared state between threads requires a lock, and a
@@ -976,7 +976,7 @@ When async is used:
   once, at the top. No library code calls `asyncio.run()` or
   `loop.run_until_complete()`.
 
-## 9. What _not_ to copy
+## 12. What _not_ to copy
 
 Some tools — job runners, daemons, anything supervising concurrent
 processes — have domains that force a density of edge-case handling:
