@@ -176,9 +176,18 @@ by a tool decays; put rules in configuration, not in code review.
   ]
   ```
 
-  Every `ignore` entry gets a comment explaining _why_ it is ignored
-  (e.g. `"T20"  # Print is intentional in a CLI tool`). Inline suppressions
-  use the specific rule code, never a bare `# noqa`.
+  Every `ignore` entry gets a comment explaining _why_ it is ignored.
+  Inline suppressions use the specific rule code, never a bare `# noqa`.
+
+  For example, CLI tools that use `print()` for data output (section 3)
+  will typically ignore the `T20` family:
+
+  ```toml
+  [tool.ruff.lint]
+  ignore = [
+      "T20",  # print() is intentional — stdout is the data channel (section 3)
+  ]
+  ```
 
 - **An attrs-compatible type checker in strict mode** for type checking.
   All code is fully annotated: the `ANN` ruff rules enforce that
@@ -211,10 +220,83 @@ track upstream changes rather than letting them pile up. Stale
 dependencies accumulate security and compatibility debt that compounds
 faster than it seems.
 
-**Target the Python version one minor behind the latest release** (e.g.
-3.14 while 3.15 gets its first year to stabilize). This gives the
-ecosystem — type checkers, attrs, key libraries — time to catch up while
-keeping us close to the leading edge.
+**Target a recent, stable Python version** — typically one minor behind
+the latest release, giving the ecosystem time to catch up, but not
+rigidly so. We adopted 3.14 roughly eight months after launch; the
+"one behind" heuristic is approximate, not a rule. What matters is that
+the version is well supported by the type checker, attrs, and the
+libraries we depend on.
+
+### Packaging and distribution
+
+Most tools are distributed as source and run where they land — on a
+developer laptop, a shared worker, a compute node, or occasionally inside
+a container. Wheels and PyPI-style distribution are uncommon but not
+unheard of. The common delivery paths are:
+
+1. **Source checkout + `uv run`.** The repository is cloned (or mounted
+   as a git submodule) and invoked directly: `uv run mytool ...`. This
+   is the simplest model and the one the rest of the guide assumes.
+2. **Containers.** Some infrastructure (GCP/GKE, CI runners) uses
+   container images. A Dockerfile may exist at the repo root, but its
+   presence does not mean all tooling in the repo will be run through
+   it — it is one deployment path among several. The tool must not
+   assume it is running inside a container, and the container must not
+   assume it is the only way the tool will be invoked.
+3. **`uv tool install`** for developer-local utilities — formatters,
+   linters, one-off scripts. This works well when the tool is
+   self-contained and used interactively; it is not appropriate for
+   production or cluster deployment.
+
+The tool must be safe to run on shared infrastructure regardless of
+the deployment mechanism. A tool that is only safe when it has a machine
+to itself has failed the design goal from the principles section — the
+isolation guarantees come from the tool's design (immutability, atomicity,
+stdin/stdout composability), not from the environment it happens to land
+in. Containers, VMs, and dedicated nodes are operational conveniences;
+they are not correctness mechanisms and must not be relied on as such.
+
+Every project has a `pyproject.toml` at its root. `setup.py` is
+forbidden — it is executable code masquerading as configuration,
+impossible to analyze statically, and unnecessary since PEP 517.
+**Use `pyproject.toml` for all Python tool configuration** — ruff,
+pytest, type checker, coverage, import-linter. Do not use standalone
+config files (`ruff.toml`, `pytest.ini`, `.flake8`, `mypy.ini`) when
+the tool supports `pyproject.toml`. One file, one place to look; a
+sprawl of dotfiles at the repo root is a sign that configuration is
+being accumulated rather than managed. When a
+monorepo contains multiple tools, each has its own `pyproject.toml` in a
+subdirectory, and cross-tool dependencies are expressed as path
+dependencies or git submodules — not as published packages with version
+constraints, unless the tool is genuinely distributed independently.
+Each submodule or subdirectory project owns its own configuration; a
+parent repo does not override a child's formatting or linting decisions.
+
+### Module API surface
+
+**`__init__.py` is not encouraged.** Implicit namespace packages
+(directories without `__init__.py`) are the default. An `__init__.py`
+that re-exports symbols creates a second name for everything it touches,
+complicates refactoring, and makes import-linter contracts harder to
+reason about. If a module needs initialization code, that code belongs in
+the entry point, not in import-time side effects.
+
+**Prefer CLI boundaries over library imports.** When one tool needs
+another tool's functionality, the default is to invoke it as a
+subprocess — stdin/stdout, exit codes, the same interface a human uses.
+This keeps the tools independently deployable, independently testable,
+and free of version-coupling. A shared library is justified when the
+overhead of serialization is genuinely prohibitive or when the shared
+code is pure computation with no IO — but it should be extracted into its
+own package with its own `pyproject.toml`, not imported across tool
+boundaries within a monorepo.
+
+When code _is_ imported as a library, define `__all__` in every public
+module to make the API surface explicit. Without `__all__`, every
+top-level name is public by convention, and consumers will eventually
+depend on names that were never meant to be stable. `__all__` is the
+module-level equivalent of a frozen attrs class: it declares what
+crosses the boundary, so that everything else can change freely.
 
 ## 2. Program structure
 
@@ -290,7 +372,8 @@ Rules:
                   "-n", "--max-jobs",
                   type=int, default=0,
               )
-      raise ValueError(f"Unknown argument: {argument}")  # unreachable; satisfies the type checker
+          case unreachable:
+              typing.assert_never(unreachable)
   ```
 
   Each command's `parse_args` calls `add_argument` for the flags it needs;
@@ -858,7 +941,7 @@ intermediate state.
   placing the cache where the OS or a system cache manager already
   handles eviction gives it a way to contain the situation before it
   becomes a critical problem for other applications on the same system. A
-  [hardened example](https://github.com/ollelindgren/cixstack/blob/main/cixstack/utils.py)
+  [hardened example](https://github.com/olle-lindgren/cixstack/blob/5282850f5057c52e73e078c9ff59ac491320c94f/cixstack/utils.py)
   is available as a reference (`_get_cache_dir()`).
 
   Resolve the cache directory once, in the entry point, and pass the
