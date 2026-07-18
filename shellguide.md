@@ -93,21 +93,28 @@ script harder to reason about.
   depending on wall-clock time — that is the signal to reconsider the
   design, not to add rerun-detection logic.
 - **Pipeline-level correctness.** A stdin/stdout pipeline under
-  `set -o pipefail` (`ingest | transform | load > output`) is already
-  atomic at the pipeline level: if any stage fails, the whole pipeline
-  fails and no output is produced — the final redirect or atomic
-  replace never completes. This is a feature of the model, not
-  something extra to build. The partial-state problem only arises when
-  stages write to intermediate files between separate invocations —
-  which is an orchestrator-level concern, not the script's. When a
-  workflow does require intermediate state (stages run as separate
-  jobs, not a single pipeline), the script's responsibility is to be
-  safe to rerun: idempotent, deterministic, atomic in its own writes.
-  A workflow manager that tracks which stages completed can rerun from
-  the failed stage precisely because each script upholds these
-  properties. Trying to solve multi-stage recovery inside the script
-  is scope creep that produces the marker-file branching this section
-  warns against.
+  `set -o pipefail` (`ingest | transform | load`) gets two properties
+  from the model, not from extra code. First, `pipefail` makes a
+  mid-pipeline failure _detectable_: the pipeline's exit code reflects
+  the failure, so the caller knows something went wrong. Second, when
+  each stage writes complete lines, any partial output from a failed
+  pipeline is a valid prefix — complete records of work that was
+  done — not corrupt garbage. Together these mean the caller can
+  safely discard and retry. Note that this is _not_ atomicity: a
+  bare redirect (`> output`) creates and truncates the destination
+  file before any stage runs, so partial output is observable on
+  disk even if the pipeline fails. True all-or-nothing requires
+  atomic replace at the end (`> "$tmpfile" && mv "$tmpfile" output`)
+  — the same pattern section 7 teaches. The partial-state problem
+  across _separate invocations_ is an orchestrator-level concern,
+  not the script's. When a workflow requires intermediate state
+  (stages run as separate jobs, not a single pipeline), the script's
+  responsibility is to be safe to rerun: idempotent, deterministic,
+  atomic in its own writes. A workflow manager that tracks which
+  stages completed can rerun from the failed stage precisely because
+  each script upholds these properties. Trying to solve multi-stage
+  recovery inside the script is scope creep that produces the
+  marker-file branching this section warns against.
 
 Every rule below is either a consequence of these principles or a
 convention adopted for consistency. The distinction matters in review:
@@ -550,7 +557,11 @@ mv "$tmpfile" output.csv
 
 The temporary file must live in the same directory (or at least the
 same filesystem) as the destination — `mv` is only atomic within a
-single filesystem.
+single filesystem. On network and distributed filesystems (NFS,
+Lustre, GPFS) the atomicity guarantee is weaker — a `mv` may be
+visible to some clients before others. This does not change the
+advice: atomic replace is still the best available primitive. Be
+aware of the limitation when targeting shared cluster storage.
 
 ### Signals
 

@@ -38,9 +38,14 @@ service of them:
    not to touch the filesystem at all — read stdin, write stdout, let the
    caller decide where state lives. When filesystem state is unavoidable,
    the two atomic patterns are _replace_ (`tempfile` + `os.rename`) and
-   _append_ (one complete record per write, as with jsonlines). Both are
-   valid; neither is universally correct — choose based on the
-   concurrency model, not by default. Append carries a life-cycle
+   _append_ (one complete record per write, as with jsonlines). Append
+   is atomic in practice when each record is small enough to complete in
+   a single `write()` syscall (well under the OS page size — a typical
+   jsonlines record qualifies easily) and the file is opened with
+   `O_APPEND`; for larger writes the kernel may split the operation, and
+   concurrent appenders can interleave. Both patterns are valid; neither
+   is universally correct — choose based on the concurrency model, not
+   by default. Append carries a life-cycle
    obligation: a file that grows without bound will at best be silently
    reclaimed by OS cache management and at worst cause storage pressure
    that takes down unrelated applications sharing the same system. If
@@ -106,13 +111,21 @@ means, it is hard to test, and it makes the tool harder to reason about.
   optional before being dropped. But it requires _no special code_ — the
   existing `attrs` + `cattrs` patterns deliver it.
 - **Pipeline-level correctness.** A stdin/stdout pipeline
-  (`ingest | transform | load > output`) is already atomic at the
-  pipeline level: if any stage fails, no output is produced — the
-  final redirect or atomic replace never completes. This is a feature
-  of the model, not something extra to build. The partial-state
-  problem only arises when stages write to intermediate files between
-  invocations — which is an orchestrator-level concern, not the
-  tool's. When a workflow does require intermediate state (stages run
+  (`ingest | transform | load`) gets two properties from the model,
+  not from extra code. First, `pipefail` (or its Python equivalent —
+  checking subprocess exit codes) makes a mid-pipeline failure
+  _detectable_: the caller knows something went wrong. Second, when
+  each stage writes complete records (jsonlines), any partial output
+  from a failed pipeline is a valid prefix — complete records of work
+  that was done — not corrupt garbage. Together these mean the caller
+  can safely discard and retry. Note that this is _not_ atomicity:
+  a bare redirect (`> output`) creates and truncates the destination
+  file before any stage runs, so partial output is observable on
+  disk even if the pipeline fails. True all-or-nothing requires
+  atomic replace at the end (`> "$tmpfile" && mv "$tmpfile" output`)
+  — the same pattern used everywhere else. The partial-state problem
+  across _separate invocations_ is an orchestrator-level concern, not
+  the tool's. When a workflow requires intermediate state (stages run
   as separate jobs, not a single pipeline), the tool's responsibility
   is to be safe to rerun: idempotent, deterministic, atomic in its
   own writes. A workflow manager that tracks which stages completed
@@ -825,7 +838,12 @@ intermediate state.
     rather than mutating the contents of the old one, so a process still
     working with the original inode is never disrupted — it keeps its
     consistent snapshot, exactly as a consumer holding a frozen object
-    does.
+    does. On network and distributed filesystems (NFS, Lustre, GPFS)
+    the atomicity guarantee is weaker — a `rename()` may be visible to
+    some clients before others, or both names may be briefly visible.
+    This does not change the advice: atomic replace is still the
+    best available primitive. Be aware of the limitation when
+    targeting shared cluster storage.
   - Ownership tokens (e.g. pid files named by checksum) checked before
     deletion, so concurrent processes cannot clobber each other.
 - **Respect platform conventions for cache and config locations.** Code
