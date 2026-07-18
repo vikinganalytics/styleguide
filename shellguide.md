@@ -9,6 +9,14 @@ the glue that connects heterogeneous components into pipelines. Its
 goal is scripts that are reliable units of work — safe to run by hand,
 under CI, or as one of a thousand parallel invocations on a cluster.
 
+A recurring strategy throughout the guide is to **left-shift errors**:
+move detection from production to CI, from CI to a linter, from a
+linter to a strict-mode default that makes the bug impossible in the
+first place. Shell has no type checker, but `set -euo pipefail`,
+disciplined quoting, and ShellCheck close many of the same gaps —
+catching at parse or lint time what would otherwise be a silent runtime
+surprise.
+
 ## Principles
 
 Three principles are the point of this guide; everything else is in
@@ -317,11 +325,36 @@ a tool, not orchestration.
 
 ## 4. Quoting and word safety
 
-**Quote every expansion.** `"$var"`, `"$@"`, `"$(command)"`. Unquoted
-expansions are word-split and glob-expanded by the shell — a filename
-with a space becomes two arguments, a string containing `*` expands
-to the contents of the current directory. These bugs are silent,
-intermittent, and often destructive.
+Shell has a design flaw that no other modern language shares: the
+language silently reinterprets data as code between the point where you
+write an expression and the point where the program it calls receives
+it. An unquoted `$var` does not expand to the value of `var` — it
+expands to the value, then the shell splits it on whitespace, then
+glob-expands each resulting word against the filesystem. The result is
+that `rm $file` where `file="my report.txt"` runs `rm my report.txt`
+— two arguments, neither of which is the file the developer intended.
+A variable containing `*` expands to every file in the current
+directory. These are not edge cases; they are the default behavior,
+and they are silent — the command runs, it just operates on the wrong
+things.
+
+This is why quoting is not a style preference — it is the shell
+equivalent of the type-safety discipline in the Python guide. Quoting
+is what closes the gap between "the value I have" and "the value the
+program receives." Without it, every expansion is an implicit,
+context-dependent transformation that the developer did not ask for
+and almost certainly did not intend.
+
+**Quote every expansion.** `"$var"`, `"$@"`, `"$(command)"`. No
+exceptions by default.
+
+**Double quotes vs single quotes is a semantic choice.** Double quotes
+allow expansion (`$var`, `$(cmd)`); single quotes suppress all
+interpretation. Use double quotes when the string contains variables;
+use single quotes when the string should reach the receiving program
+literally — patterns, `jq` filters, `awk` programs — because
+double-quoting `'{print $3}'` silently turns `$3` into a shell
+expansion.
 
 The rare intentional unquoted expansion gets a comment explaining why
 — same discipline as a ShellCheck suppression:
@@ -335,11 +368,16 @@ cmd $flags
 
 ### Arrays for lists
 
-Use bash arrays for lists of things. Never store multiple items in a
-space-separated string:
+A space-separated string is not a list — it is a string that happens
+to contain spaces, and the shell cannot tell the difference between a
+delimiter space and a space that is part of a value. This is the same
+category of bug as unquoted expansions: data is reinterpreted through
+a transformation the developer did not request. Bash arrays are the
+construct that keeps items discrete through every operation — assignment,
+iteration, and expansion:
 
 ```bash
-# Good
+# Good — each element stays intact regardless of its content
 files=("$input_dir"/*.csv)
 for f in "${files[@]}"; do
     process "$f"
@@ -352,18 +390,27 @@ for f in $files; do
 done
 ```
 
-When passing lists between programs, use newline-delimited or
-null-delimited (`\0`) streams and `xargs`:
+When passing lists between programs, the process boundary means arrays
+cannot cross directly. Use null-delimited (`\0`) streams — the only
+delimiter that cannot appear in a filename — and `xargs` to
+reconstruct the list on the other side:
 
 ```bash
 find "$dir" -name '*.csv' -print0 | xargs -0 -I{} process {}
 ```
 
+Newline-delimited is acceptable when filenames are known not to
+contain newlines, but null-delimited is always safe.
+
 ### Filenames and paths
 
-Never parse `ls` output. Use globs (`*.csv`) or `find`. Assume
+Never parse `ls` output. `ls` is a display tool — its output format
+is designed for humans, not programs, and it mangles filenames that
+contain whitespace, quotes, or special characters. Use globs
+(`*.csv`) or `find`, which preserve filenames exactly. Assume
 filenames can contain spaces, quotes, and any character except null —
-because they can.
+because they can, and on a shared filesystem under orchestration,
+they eventually will.
 
 ## 5. External tools
 
@@ -531,14 +578,24 @@ warn() { echo "[$(basename "$0")] WARNING: $*" >&2; }
 err() { echo "[$(basename "$0")] ERROR: $*" >&2; }
 ```
 
-Include the script name — when the output of several scripts is
-interleaved (a common situation under orchestration), unnamed
-messages are useless.
+**Include the script name in every message.** When a scheduler runs
+hundreds of copies of different scripts, their stderr streams are
+interleaved — often into a single log file or journal. A message
+without a source name is a message no one can act on: the operator
+sees "processing failed" but cannot tell which script, which job, or
+which invocation produced it. The script name is the minimum context
+that makes a diagnostic actionable under orchestration.
 
-**Do not log success at every step.** When a thousand copies of the
-script run in parallel, per-step progress messages become noise that
-obscures real problems. Log what matters: errors, warnings, and
-significant milestones (started, finished, skipped).
+**Do not log success at every step.** The instinct to log progress
+("processing file 1...", "processing file 2...") comes from
+interactive use, where the developer watches the output scroll by.
+Under orchestration, that output is not watched — it is stored. When
+a thousand copies of the script run in parallel, per-step progress
+messages produce gigabytes of noise that obscure the one `ERROR` line
+an operator is searching for. Log what changes the script's contract
+with its caller: errors, warnings, and significant milestones
+(started, finished, skipped). If a script succeeds, silence is the
+correct signal — the exit code already communicates success.
 
 ## 9. Testing
 
