@@ -1,6 +1,7 @@
 ---
 permalink: /pyguide
 ---
+
 # Python Style Guide for Tooling
 
 This guide describes how we build Python tooling: command-line tools,
@@ -378,6 +379,7 @@ Rules:
 
   Each command's `parse_args` calls `add_argument` for the flags it needs;
   the definition stays in one place.
+
 - **`main` returns an exit code**; only the top-level entry point calls
   `sys.exit`.
 
@@ -398,6 +400,23 @@ a CI failure rather than a review catch. Lower layers know nothing of
 what sits above them, and sibling commands cannot couple to each other.
 Code two commands both need lives one layer down, imported by both —
 never in one command, imported by the other.
+
+What deserves to live one layer down is _knowledge_, not lookalike
+code. A fact of the system — a flag's definition, a path convention, a
+record schema — must have exactly one home, because two homes will
+eventually disagree; that is what the shared `Argument` enum is
+(section 2). Code that merely looks similar is a different matter
+entirely. An abstraction must be justified by its own design — a
+boundary that would be genuinely good even if it had only one caller —
+never by the number of duplicate sites it would absorb. Ten sites of
+honest boilerplate are cheaper than one abstraction that fits none of
+them well: the boilerplate stays local, independent, and free to
+diverge as the commands evolve, while a bad shared abstraction taxes
+every caller forever and punishes the next person who needs it to bend.
+The world is full of boilerplate, and sometimes that is fine. If the
+genuinely good abstraction exists, extract it; if it doesn't, the
+duplication is not a debt — it is the honest representation of code
+that happens to look alike today and has no deeper unity.
 
 ## 3. Streams and IO
 
@@ -619,6 +638,7 @@ absorbed into a frozen attrs field.
   in. Without it, the caller may repurpose and mutate that list or dict
   for its own ends after handing it to you — and your "immutable" object
   now changes underneath you.
+
 - **Immutable by default.** Return concrete immutable types — `frozenset`,
   `tuple`, `Mapping` — chosen to fit the data, not one container for
   everything. Derive new state with `attrs.evolve(ctx, ...)`, never by
@@ -664,6 +684,7 @@ absorbed into a frozen attrs field.
   that is not needed at runtime, guard it with `if TYPE_CHECKING:` — a
   type-only dependency is not a real dependency, and is no reason to
   leave an annotation vague.
+
 - **Modern syntax throughout**: builtin generics (`frozenset[str]`), `X | Y`
   unions, `pathlib` exclusively for paths.
 - **cattrs** for (de)serialization of config files and jsonlines records
@@ -681,6 +702,39 @@ absorbed into a frozen attrs field.
   requires in practice — see the
   [cattrs documentation](https://catt.rs/en/stable/) for the full hook
   API when the defaults are not enough.
+
+### Inheritance
+
+**Implementation inheritance is the strongest form of coupling this
+guide has occasion to warn against, and it is strongly discouraged.**
+A subclass does not consume its parent through a contract; it reaches
+into the parent's implementation — overriding methods the parent calls
+on itself, depending on attribute initialization order, breaking when
+a detail the parent considered private changes. Full annotation
+(section 5) does not save you here, because the problem is not
+unchecked code: every line of both classes is checked, but the
+dependency a subclass takes on its parent's self-call structure and
+initialization order has no type-level representation, so there is
+nothing for the checker to verify. This is the failure mode this
+section exists to prevent — implementation shared with code you don't
+control — made structural and permanent, and placed beyond the reach
+of the tools that guard every other boundary. The colleague who
+rewrites the parent six months from now cannot see your subclass's
+assumptions, and nothing will tell either of you what broke.
+
+Hierarchies are therefore capped at two levels: an abstract interface
+— a `Protocol`, or an ABC when runtime `isinstance` checks are
+genuinely needed — and its implementations. Never deeper. The abstract
+base is a type-checkable template declaring what implementations
+expose to the outside world, and never anything more: no logic, no
+state, no helper methods for implementations to inherit. A base class
+that accumulates shared logic is never needed, because everything it
+would hold already has a better home — shared behavior is a plain
+function in a utils module that both implementations call, shared
+state is a frozen attrs object that both compose as a field, and
+variants of a concept are a tagged union (section 6). Subclassing
+`Enum` and `Exception` is fine — those are the stdlib's designated
+extension points and carry no implementation to couple to.
 
 ## 6. Type precision
 
@@ -821,6 +875,24 @@ review.
   stdout immediately, keeping memory bounded and ensuring that work
   completed before an interruption is never lost.
 
+- **Return a value or perform an effect — never both.** Every function
+  picks a side. A _query_ computes and returns a result, touching
+  nothing; a _command_ performs its effect and returns `None`.
+  Mutation is already the discouraged option (section 5) — most
+  functions should be queries — but where an effect is genuinely the
+  point, keep it unmixed. A function that mutates _and_ returns a
+  result has a signature that no longer tells the whole truth: the
+  type checker sees and verifies the return type while the effect
+  travels invisibly beside it, so callers come to rely on the return
+  value while overlooking the effect, or the reverse. The split also
+  serves principle 3 directly: a pure query is trivially safe to call
+  again, and a command that does exactly one thing is the unit that
+  the atomic patterns of section 9 can actually make atomic — an
+  operation smeared across a computation has no single point at which
+  to commit. The entry-point convention `main(ctx) -> int` is not an
+  exception: the exit code is the command's status report, not a
+  computed result.
+
 ## 8. Errors
 
 - **One translation point.** The top-level `main()` is the only place that
@@ -911,6 +983,7 @@ intermediate state.
   silently on `SIGPIPE`, like every other Unix tool. Stdout is data and
   pipes are the composition model — a tool that breaks when piped
   through `head` is not composable.
+
 - **Treat shared filesystem state as crash-tolerant, not locked:**
   - Idempotent initialization (`mkdir(exist_ok=True)`, `touch`) at every
     startup — no "first run" special case.
@@ -962,13 +1035,153 @@ intermediate state.
 - Partition on-disk formats by anything that breaks compatibility (e.g.
   pickle caches keyed by Python minor version).
 
-## 10. Testing
+## 10. Verification and testing
+
+The left-shift strategy that governs production code applies with equal
+force to the code that verifies it. Just as the production application
+is code that validates and transforms state, the developer environment
+is code that transforms code — the details differ, but a mindset that
+succeeds in one will succeed in the other. A verification pipeline that
+takes thirty minutes to tell you about a typo has the same design
+failure as a production pipeline that takes thirty minutes to tell you
+about an invalid input: the feedback is correct but arrives too late to
+be useful, so people route around it.
+
+### The verification pipeline
+
+Verification is a pipeline of stages, ordered by speed and by cost of
+the infrastructure they require. Each stage catches a class of errors
+that the stages before it cannot, and each stage is slower than the one
+before it. The developer's job is to push as much assurance as possible
+into the earliest, fastest stages — and the codebase's job is to make
+that possible.
+
+```
+format  →  lint  →  type check  →  unit test  →  integration test  →  postmerge
+```
+
+1. **Format** (ruff format). Subsecond. Rewrites style violations
+   mechanically. No human time should ever be spent on formatting
+   disagreements — the formatter is the authority, and it is fast enough
+   to run on every save.
+2. **Lint** (ruff check). Subsecond. Catches mechanical errors —
+   unused imports, unreachable code, banned patterns — that are beneath
+   the type checker's concern. A lint failure is a local fix, never a
+   design discussion.
+3. **Type check** (ty). Seconds over the entire codebase. Verifies that
+   contracts hold across every call site, every branch, every module
+   boundary. This is the stage where the investment in precise types
+   (sections 5 and 6) pays off: the type checker finds the bug that a
+   test would need a specific input to trigger, and it finds it in every
+   code path simultaneously, not just the ones the tests happen to
+   exercise. A type checker that runs in seconds over the full codebase
+   is fast enough to run on every save; one that takes minutes is not,
+   and the assurance it provides arrives too late.
+4. **Unit tests** (pytest). Seconds — under one second for the files you
+   changed, under a minute for the full suite. No external
+   dependencies: no database, no network, no container, no
+   `docker compose up`. A developer runs a single test file with
+   `pytest path/to/test.py` and nothing else running. This is the
+   fastest stage that exercises runtime behavior, and its speed is what
+   makes incremental development possible — change a function, run its
+   tests, see the result, iterate. Everything that can be verified here
+   _must_ be verified here.
+5. **Integration tests**. Minutes to tens of minutes. Requires local
+   services — a database, a message queue, a container stack. Tests
+   contracts across real infrastructure boundaries: does the query
+   actually work against the real database engine, does the serialized
+   message parse on the other side. This is the first stage where
+   feedback is slow enough to interrupt flow, and the boundary between
+   "I run this on every change" and "I run this before I push."
+6. **Postmerge / system tests**. Minutes to hours. The full production
+   stack, end-to-end scenarios, environments that cannot be reproduced
+   locally. Runs in CI after merge, or in a staging environment.
+   Failures here are expensive — they block the pipeline and require
+   context-switching back to code the developer has mentally left
+   behind.
+
+The time budget in each tier is minimized ruthlessly. ruff makes
+formatting and linting fast. ty makes type checking fast. But unit test
+speed is not a property of the test framework — it is a property of the
+code's design. A codebase where business logic is entangled with
+database clients and HTTP sessions cannot have fast unit tests no matter
+what test runner it uses. The investment is in the production code:
+inject dependencies (section 9), type interfaces as protocols, keep
+logic pure. The fast tests follow.
+
+### What makes a unit test a unit test
+
+**A test's infrastructure requirements must not exceed what the code
+under test actually touches.** A function that transforms a dict does
+not need MongoDB. A service method that dispatches work based on
+configuration does not need a message broker. If the test requires
+infrastructure the code does not, one of two things is true: the test is
+testing the wrong thing, or the code has a dependency it should not.
+
+A "unit" test that requires `docker compose up` is an integration test
+that has been misfiled. The label matters because it poisons the tier:
+one test file that needs a running database means _no_ unit test can run
+without the full stack, the tier's speed guarantee is broken, and
+developers stop running it locally. The damage is not to that one test —
+it is to every test in the directory.
+
+**Design for injection, not for mocking infrastructure.** The reason a
+test needs a database is almost never that the logic under test
+genuinely requires one — it is that the logic reaches for a database
+client it was handed at module level or constructs internally. Section
+9's injection discipline solves this at the source: when the database is
+a parameter typed as `MutableMapping` or a `Protocol`, the test passes a
+dict. No patching, no test containers, no startup cost. If you cannot
+substitute a plain in-memory object for a dependency in a unit test,
+that dependency's interface is too wide — narrow it. For those of you
+wearing an architect hat, now is the time to pause a moment and think
+about how your tech stack forms its verification infrastructure - code
+that expects a redis client can get a dictionary, but for something
+expecting a psycopg.Connection, faking it is not so easy now, is it?
+Make your architecture calls accordingly.
+
+Guard the tier boundary in CI: the unit tier should run in a stripped
+environment where no external service is reachable, so that a test that
+silently depends on infrastructure fails immediately and visibly — not
+six months later when someone tries to run `pytest tests/unit/` on a
+train.
+
+### The cost equation
+
+The cost of a test is not what it costs to write — it is what it costs
+to _run_, multiplied by every developer, every branch, every CI
+invocation, for the lifetime of the project. A 90-second integration
+test is justified when it guards a real integration boundary. The same
+90 seconds spent testing a pure function — because the fixture happened
+to be convenient, or because "we already have the database up anyway" —
+is waste that compounds silently. Nobody notices the moment unit tests
+cross from one second to one minute; everybody notices when the full
+suite takes forty-five minutes and developers stop running it.
+
+The strategy is the same as in production code: when something is too
+slow, do not optimize — restructure so the expensive operation is not
+needed. Do not make integration tests faster; make them fewer, by moving
+the assurance they provide into the unit tier. Every function you
+extract from a database-dependent method into a pure function is a
+function whose tests drop from the integration tier to the unit tier —
+minutes become milliseconds, and the coverage _improves_, because a unit
+test can exercise edge cases that an integration test is too slow to
+bother with.
+
+### Testing rules
 
 - **pytest**, with `tmp_path` for filesystem work. Because resources and
   locations are injected (section 9), tests rarely need patching at all:
   hand in `{}` for the cache, `tmp_path` for the cache directory. Reaching
   for `unittest.mock.patch` is a signal that something should have been
   injected — and never monkeypatch internals of the unit under test.
+  The substitute must honor the protocol's _semantics_, not just its
+  shape: `{}` works as the cache because a dict is a real
+  `MutableMapping` with real behavior, so the test exercises the same
+  contract production code runs against. A `Mock` satisfies the type
+  checker and nothing else — it returns a `Mock` from `.get()`,
+  accepts calls no real backend would accept, and lets a test pass
+  against behavior that exists nowhere in production.
 - **Parametrize aggressively** (`@pytest.mark.parametrize` with tuple-style
   argnames) instead of copy-pasted test bodies.
 - **Every test gets a docstring** explaining _what_ is being tested and
@@ -983,6 +1196,16 @@ intermediate state.
   that consumes arbitrary user input.
 - Coverage is enforced in CI at a high floor; test against the public
   behavior (files written, exit codes, output), not private call sequences.
+- **Separate test tiers by infrastructure cost.** A typical layout:
+  - `tests/unit/` — no external dependencies, runs in a sandbox, fast
+    enough to run on every save.
+  - `tests/integration/` — requires local services (a database, a
+    message queue), tests contracts across boundaries.
+  - `tests/system/` — requires the full stack, tests end-to-end
+    behavior.
+
+  CI runs all tiers. The tiers are independently runnable — `pytest
+tests/unit/` succeeds with nothing else running, always.
 
 ## 11. Concurrency
 
@@ -1076,6 +1299,18 @@ The order of preference is:
    ownership tokens instead of coordination).
 3. Only then, **handle it explicitly** — with a comment explaining why it
    can occur.
+
+The same warning applies to design ideas imported from object-oriented
+tradition. "Open for extension, closed for modification" — plugin
+registries, hook systems, subclass-to-extend frameworks — optimizes
+for adding a variant without touching existing code. This guide wants
+the opposite. Exhaustive `match` with `assert_never` (section 6) makes
+a new variant _deliberately_ break every site that must handle it, at
+type-check time: the checker hands you the complete list of places the
+change must touch. Extension without modification sounds like a virtue
+and is here the failure mode — the new variant flows silently into
+default arms and generic handlers that were never designed, tested, or
+reasoned about with it in mind.
 
 If you find yourself writing many special cases, first ask whether the
 design can be changed so they cannot happen. That principle — not the edge
