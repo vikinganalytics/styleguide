@@ -889,9 +889,17 @@ review.
   again, and a command that does exactly one thing is the unit that
   the atomic patterns of section 9 can actually make atomic — an
   operation smeared across a computation has no single point at which
-  to commit. The entry-point convention `main(ctx) -> int` is not an
-  exception: the exit code is the command's status report, not a
-  computed result.
+  to commit.
+
+  The entry-point convention `main(ctx) -> int` is the one deliberate
+  exception. `main` performs effects _and_ returns a value — but the
+  value is the process exit code, which is not domain data: it is how
+  Unix processes report success or failure to their caller. The
+  trade-off is worth it because it enables
+  `sys.exit(main(parse_args(sys.argv[1:])))` — the entire program
+  flow as a single composable expression, no intermediate variables,
+  no mutable state, the full pipeline visible in one line. Keep the
+  exception to this one site; everywhere else, pick a side.
 
 ## 8. Errors
 
@@ -1129,16 +1137,13 @@ it is to every test in the directory.
 test needs a database is almost never that the logic under test
 genuinely requires one — it is that the logic reaches for a database
 client it was handed at module level or constructs internally. Section
-9's injection discipline solves this at the source: when the database is
-a parameter typed as `MutableMapping` or a `Protocol`, the test passes a
-dict. No patching, no test containers, no startup cost. If you cannot
-substitute a plain in-memory object for a dependency in a unit test,
-that dependency's interface is too wide — narrow it. For those of you
-wearing an architect hat, now is the time to pause a moment and think
-about how your tech stack forms its verification infrastructure - code
-that expects a redis client can get a dictionary, but for something
-expecting a psycopg.Connection, faking it is not so easy now, is it?
-Make your architecture calls accordingly.
+9's injection discipline solves this at the source: when the dependency
+is a parameter typed as a `Protocol`, the test passes a lightweight
+in-memory implementation — a dict for a `MutableMapping`, a dataclass
+for a read-only store. No patching, no test containers, no startup cost.
+If you cannot substitute a plain in-memory object for a dependency in a
+unit test, that dependency's interface is too wide — narrow the protocol
+until you can.
 
 Guard the tier boundary in CI: the unit tier should run in a stripped
 environment where no external service is reachable, so that a test that
@@ -1175,13 +1180,20 @@ bother with.
   hand in `{}` for the cache, `tmp_path` for the cache directory. Reaching
   for `unittest.mock.patch` is a signal that something should have been
   injected — and never monkeypatch internals of the unit under test.
-  The substitute must honor the protocol's _semantics_, not just its
-  shape: `{}` works as the cache because a dict is a real
-  `MutableMapping` with real behavior, so the test exercises the same
-  contract production code runs against. A `Mock` satisfies the type
-  checker and nothing else — it returns a `Mock` from `.get()`,
-  accepts calls no real backend would accept, and lets a test pass
-  against behavior that exists nowhere in production.
+  The right test doubles are **fakes** (lightweight real implementations —
+  a dict for a `MutableMapping`, an in-memory store for a repository
+  protocol) and **stubs** (canned return values — `lambda: 42`). Both
+  honor the dependency's semantics: a dict *is* a real `MutableMapping`
+  with real behavior, so the test exercises the same contract production
+  code runs against. Use them when the real dependency is slow or
+  heavy — they left-shift most bugs into the unit tier, where feedback
+  is immediate. An integration test against the real dependency is still
+  needed to cover the boundary itself; the two tiers complement each
+  other, and a good verification setup has both. What you must not use
+  is `unittest.mock.Mock`: it
+  satisfies the type checker and nothing else — it returns a `Mock` from
+  `.get()`, accepts calls no real backend would accept, and lets a test
+  pass against behavior that exists nowhere in production.
 - **Parametrize aggressively** (`@pytest.mark.parametrize` with tuple-style
   argnames) instead of copy-pasted test bodies.
 - **Every test gets a docstring** explaining _what_ is being tested and
