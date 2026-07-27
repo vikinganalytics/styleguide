@@ -173,7 +173,7 @@ by a tool decays; put rules in configuration, not in code review.
   extend-select = [
       'ANN', 'ARG', 'B', 'C4', 'E', 'EXE', 'F', 'FBT', 'FURB', 'I', 'ICN',
       'LOG', 'N', 'PERF', 'PGH', 'PIE', 'PLC0415', 'PLE', 'PT', 'PTH', 'Q',
-      'RET', 'RUF', 'S', 'SIM', 'T10', 'TC', 'TD', 'TRY', 'UP', 'W', 'YTT',
+      'RET', 'RUF', 'S', 'SIM', 'T10', 'TD', 'TRY', 'UP', 'W', 'YTT',
   ]
   ```
 
@@ -1183,7 +1183,7 @@ bother with.
   The right test doubles are **fakes** (lightweight real implementations —
   a dict for a `MutableMapping`, an in-memory store for a repository
   protocol) and **stubs** (canned return values — `lambda: 42`). Both
-  honor the dependency's semantics: a dict *is* a real `MutableMapping`
+  honor the dependency's semantics: a dict _is_ a real `MutableMapping`
   with real behavior, so the test exercises the same contract production
   code runs against. Use them when the real dependency is slow or
   heavy — they left-shift most bugs into the unit tier, where feedback
