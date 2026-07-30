@@ -209,6 +209,33 @@ by a tool decays; put rules in configuration, not in code review.
   full suite runs identically on a developer machine, in a git hook, and
   in CI — one command to check, one command to fix.
 
+### Running Python: `uv run`, not activated environments
+
+Invoke Python through `uv run` (`uv run mytool ...`, `uv run pytest`,
+`uv run python`). Do not hand-create, activate, source, or mutate virtual
+environments as part of normal work: no `python -m venv`, no
+`source .venv/bin/activate`, no `pip install` into an env. `uv` manages
+`.venv` for you and reconciles it to `uv.lock` on every `uv run` — the
+environment is a pure function of `pyproject.toml` + `uv.lock`, evaluated
+fresh per invocation, with `uv run --locked` failing loudly on any drift.
+
+Activation is the opposite: it mutates your shell (`PATH`, `VIRTUAL_ENV`)
+with a lifetime that outlives the command and is inherited by every child
+process. That is a long-lived mutable global, and it makes a whole class
+of bugs representable — the wrong env active, a stale `VIRTUAL_ENV`
+inherited by a subprocess, an env silently drifted from the lock. `uv run`
+has no such state to get wrong, and behaves identically on a laptop, an
+HPC node, and under a thousand-way fan-out — the "one binary, every
+environment" goal.
+
+Containers are the notable case where this flips: inside a Dockerfile,
+`uv run` is usually the wrong tool, and getting a uv-based image right
+(layer caching, `--frozen`, bytecode compilation, not shipping uv into the
+final stage) has enough sharp edges that it is worth following Astral's
+published guidance rather than improvising. This is not the Dockerfile
+style guide — just know that the container build is a different problem
+than running the tool.
+
 ### Dependencies and Python version
 
 **Version pinning through uv is mandatory.** Every dependency is locked to
